@@ -3,7 +3,12 @@ golden logits reference so the C port can be proven correct before it touches
 hardware.
 
 Format is deliberately dead-simple (the C reader is ~30 lines):
-  [header: magic + int32 config fields]
+  [header: magic "PLE\0", version, header_bytes, flags, input/output vocab,
+   then int32 config fields]
+  header_bytes lets a later version append fields without breaking readers.
+  flags bit 0 is TIED_HEAD: the output head IS the token embedding and no
+  separate head tensor follows. An untied model sets output_vocab
+  independently and appends the head as the final tensor.
   then, in a fixed order the C code hard-codes, each tensor as either
     QUANT: int4 codes packed 2-per-byte (group-wise, group=G along last dim)
            followed by fp16 scales, one per group
@@ -21,13 +26,19 @@ import sys
 import numpy as np
 import torch
 
+from tokenizers import Tokenizer
+
 from model import Config, TinyLM
 from quantize import quantize_groupwise
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 RUNS = os.path.join(HERE, "..", "runs")
 OUT = os.path.join(HERE, "..", "firmware", "model")
-MAGIC = 0x504C4531  # "PLE1"
+TOK = os.path.join(HERE, "..", "data", "bpe32768.json")
+MAGIC = 0x00454C50  # "PLE\0"
+FORMAT_VERSION = 1
+HEADER_BYTES = 56
+FLAG_TIED_HEAD = 1 << 0
 GROUP = 128  # uniform; fp16 scales + ragged packing keep the 28.9M model < 16MB
 
 
@@ -115,11 +126,20 @@ def main():
         else:
             blobs.append(("F", name, t.shape, t.contiguous().numpy().astype(np.float32), None))
 
+    # The embedding and PLE table store cfg.vocab_size padded rows, but only the
+    # tokenizer's entries can ever be produced or decoded. output_vocab is that
+    # count, so the header describes what the runtime actually scores instead of
+    # leaving the firmware to cap it from a generated header.
+    out_vocab = Tokenizer.from_file(TOK).get_vocab_size()
+    print(f"input_vocab={cfg.vocab_size}  output_vocab={out_vocab} (from tokenizer)")
+
     # Write binary.
     path = os.path.join(OUT, "model.bin")
     with open(path, "wb") as f:
-        f.write(struct.pack("<I", MAGIC))
-        for v in [cfg.vocab_size, cfg.d_model, cfg.n_layers, cfg.n_heads,
+        flags = FLAG_TIED_HEAD  # this model ties the head to the embedding
+        f.write(struct.pack("<IIII", MAGIC, FORMAT_VERSION, HEADER_BYTES, flags))
+        f.write(struct.pack("<II", cfg.vocab_size, out_vocab))
+        for v in [cfg.d_model, cfg.n_layers, cfg.n_heads,
                   cfg.ffn_hidden, cfg.ple_dim, cfg.seq_len, GROUP]:
             f.write(struct.pack("<i", v))
         f.write(struct.pack("<f", cfg.rope_theta))
@@ -142,7 +162,10 @@ def main():
     if "head.weight" in dq_sd:
         dq_sd["head.weight"] = dq_sd["tok_emb.weight"]
 
-    # Golden: load dequantized weights, forward a fixed prompt, dump last-pos logits.
+    # Golden: load dequantized weights, forward a fixed prompt, dump last-pos
+    # logits, truncated to out_vocab. The runtime scores exactly that many, so a
+    # longer reference would only compare untrained padding rows the device
+    # never evaluates.
     gold = TinyLM(cfg)
     gold.load_state_dict(dq_sd)
     gold.eval()
@@ -150,7 +173,7 @@ def main():
     ids = torch.tensor([prompt])
     with torch.no_grad():
         logits, _ = gold(ids)
-    last = logits[0, -1].numpy().astype(np.float32)
+    last = logits[0, -1].numpy().astype(np.float32)[:out_vocab]
     np.savez(os.path.join(OUT, "golden.npz"),
              prompt=np.array(prompt, dtype=np.int32), logits=last)
     # Text form for the C host verifier: plen, prompt ids, then V logits.

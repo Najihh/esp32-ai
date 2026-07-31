@@ -42,6 +42,133 @@ static double max_abs_diff(const float *a, const float *b, int n) {
   return m;
 }
 
+/* ---- synthetic untied model -------------------------------------------------
+ * The exporter only ever writes TIED_HEAD, so without this the untied branch of
+ * llm_load is unexecuted code. Build a tiny valid image with TIED_HEAD clear and
+ * output_vocab != input_vocab, and check the loader binds a separate head at the
+ * right offset. */
+static size_t qt_bytes(int rows, int cols, int group) {
+  int ng = (cols + group - 1) / group, rb = (cols + 1) / 2;
+  return 4 + (size_t)rows * rb + (size_t)rows * ng * 2;
+}
+
+static uint8_t *put_qt(uint8_t *p, int rows, int cols, int group, uint8_t fill) {
+  int ng = (cols + group - 1) / group, rb = (cols + 1) / 2;
+  int32_t g = group; memcpy(p, &g, 4); p += 4;
+  memset(p, fill, (size_t)rows * rb); p += (size_t)rows * rb;
+  for (int i = 0; i < rows * ng; i++) { uint16_t h = 0x3C00; memcpy(p, &h, 2); p += 2; } /* 1.0 */
+  return p;
+}
+static uint8_t *put_f(uint8_t *p, int n, float v) {
+  for (int i = 0; i < n; i++) { memcpy(p, &v, 4); p += 4; }
+  return p;
+}
+
+static void test_untied(void) {
+  const int V = 16, VOUT = 6, D = 8, L = 1, H = 2, F = 4, P = 4, G = 128;
+  size_t need = 56 + qt_bytes(V, D, G) + qt_bytes(L * P, D, G) + (size_t)P * 4
+              + qt_bytes(V, L * P, G)
+              + (size_t)D * 4 + qt_bytes(3 * D, D, G) + qt_bytes(D, D, G)
+              + (size_t)D * 4 + qt_bytes(F, D, G) + qt_bytes(F, D, G)
+              + qt_bytes(D, F, G) + qt_bytes(P, D, G) + qt_bytes(D, P, G)
+              + (size_t)D * 4
+              + (size_t)D * 4 + qt_bytes(VOUT, D, G);
+  uint8_t *img = calloc(need, 1), *p = img;
+  uint32_t hdr[4] = {0x00454C50u, 1u, 56u, 0u};   /* TIED_HEAD clear */
+  memcpy(p, hdr, 16); p += 16;
+  uint32_t vio[2] = {(uint32_t)V, (uint32_t)VOUT};
+  memcpy(p, vio, 8); p += 8;
+  int32_t cfg[7] = {D, L, H, F, P, 32, G};
+  memcpy(p, cfg, 28); p += 28;
+  float rope = 10000.f; memcpy(p, &rope, 4); p += 4;
+
+  p = put_qt(p, V, D, G, 0x99);              /* tok_emb */
+  p = put_qt(p, L * P, D, G, 0x88);          /* ple_model_proj */
+  p = put_f(p, P, 1.f);                      /* ple_proj_norm */
+  p = put_qt(p, V, L * P, G, 0x88);          /* ple_table */
+  p = put_f(p, D, 1.f);                      /* attn_norm */
+  p = put_qt(p, 3 * D, D, G, 0x88);
+  p = put_qt(p, D, D, G, 0x88);
+  p = put_f(p, D, 1.f);                      /* ffn_norm */
+  p = put_qt(p, F, D, G, 0x88);
+  p = put_qt(p, F, D, G, 0x88);
+  p = put_qt(p, D, F, G, 0x88);
+  p = put_qt(p, P, D, G, 0x88);
+  p = put_qt(p, D, P, G, 0x88);
+  p = put_f(p, D, 1.f);                      /* ple_norm */
+  p = put_f(p, D, 1.f);                      /* out_norm */
+  uint8_t *head_at = p;
+  p = put_qt(p, VOUT, D, G, 0x77);           /* out_head, distinct fill */
+
+  /* Reject malformed headers before any tensor is bound. Each case flips one
+   * field of an otherwise valid image. */
+  printf("\nheader validation rejects malformed images\n");
+  {
+    /* header field offsets: magic 0, version 4, header_bytes 8, flags 12,
+     * input_vocab 16, output_vocab 20, dim 24, n_layers 28, n_heads 32,
+     * ffn 36, ple_dim 40, seq_len 44, group 48, rope_theta 52 */
+    struct { const char *what; int off; uint32_t val; } bad[] = {
+      {"bad magic",                  0,  0x11223344u},
+      {"version 0",                  4,  0u},
+      {"version from the future",    4,  LLM_FORMAT_VERSION + 1u},
+      {"header_bytes too small",     8,  8u},
+      {"header_bytes absurd",        8,  1u << 20},
+      {"unknown flag bit",          12,  1u << 7},
+      {"input_vocab 0",             16,  0u},
+      {"output_vocab 0",            20,  0u},
+      {"dim 0",                     24,  0u},
+      {"dim not divisible by heads",24,  9u},
+      {"odd head dim",              24,  10u},   /* 10/2=5, RoPE needs even */
+      {"n_layers 0",                28,  0u},
+      {"n_layers over the cap",     28,  (uint32_t)(LLM_MAX_LAYERS + 1)},
+      {"n_heads 0",                 32,  0u},
+      {"ffn 0",                     36,  0u},
+      {"ple_dim 0",                 40,  0u},
+      {"seq_len 0",                 44,  0u},
+      {"group 0",                   48,  0u},
+    };
+    Model bm;
+    for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
+      uint8_t *c = malloc(need);
+      memcpy(c, img, need);
+      memcpy(c + bad[i].off, &bad[i].val, 4);
+      int r = llm_load(c, &bm);
+      char d[48]; snprintf(d, sizeof d, "rc=%d", r);
+      check(bad[i].what, r != 0, d);
+      free(c);
+    }
+    /* A tied head cannot be longer than the embedding it views. */
+    uint8_t *c = malloc(need);
+    memcpy(c, img, need);
+    uint32_t tied = LLM_FLAG_TIED_HEAD, big = 999u;
+    memcpy(c + 12, &tied, 4);
+    memcpy(c + 20, &big, 4);          /* output_vocab > input_vocab */
+    int r = llm_load(c, &bm);
+    char d[48]; snprintf(d, sizeof d, "rc=%d", r);
+    check("tied output_vocab > input_vocab", r != 0, d);
+    free(c);
+  }
+
+  printf("\nuntied format (synthetic)\n");
+  Model u;
+  int rc = llm_load(img, &u);
+  check("llm_load accepts TIED_HEAD clear", rc == 0, "");
+  if (rc == 0) {
+    char d[96];
+    snprintf(d, sizeof d, "in=%d out=%d", u.c.vocab, u.out_vocab);
+    check("input_vocab and output_vocab differ",
+          u.c.vocab == V && u.out_vocab == VOUT, d);
+    check("out_head is a separate tensor, not tok_emb",
+          u.out_head.codes != u.tok_emb.codes, "");
+    check("out_head bound at the trailing offset",
+          u.out_head.codes == head_at + 4, "");
+    check("out_head has out_vocab rows", u.out_head.rows == VOUT, "");
+    snprintf(d, sizeof d, "%zu vs %zu", u.image_bytes, need);
+    check("image_bytes covers the head", u.image_bytes == need, d);
+  }
+  free(img);
+}
+
 int main(int argc, char **argv) {
   const char *path = argc > 1 ? argv[1] : "firmware/model/model.bin";
   FILE *f = fopen(path, "rb");
@@ -53,8 +180,9 @@ int main(int argc, char **argv) {
 
   Model m;
   if (llm_load(buf, &m)) { fprintf(stderr, "bad magic\n"); return 2; }
-  printf("model: V=%d D=%d L=%d ffn=%d ple=%d  image=%zu bytes\n\n",
-         m.c.vocab, m.c.dim, m.c.n_layers, m.c.ffn, m.c.ple_dim, m.image_bytes);
+  printf("model: Vin=%d Vout=%d D=%d L=%d ffn=%d ple=%d  image=%zu bytes\n\n",
+         m.c.vocab, m.out_vocab, m.c.dim, m.c.n_layers, m.c.ffn, m.c.ple_dim,
+         m.image_bytes);
 
   printf("image_bytes\n");
   check("equals file size", (long)m.image_bytes == sz, "");
@@ -123,7 +251,7 @@ int main(int argc, char **argv) {
   printf("\nplatform hook dispatch\n");
   Scratch s;
   memset(&s, 0, sizeof s);
-  int L = m.c.n_layers, F = m.c.ffn, S = m.c.seq_len, V = m.c.vocab;
+  int L = m.c.n_layers, F = m.c.ffn, S = m.c.seq_len, V = m.out_vocab;
   s.x = calloc(D, 4); s.h = calloc(F > D ? F : D, 4);
   s.qkv = calloc(3 * D, 4); s.att = calloc(D, 4);
   s.g1 = calloc(F, 4); s.g2 = calloc(P > F ? P : F, 4);
@@ -150,6 +278,8 @@ int main(int argc, char **argv) {
   check("head_matvec called once", head_hook_calls == 1, d2);
   check("hooked forward == unhooked forward",
         max_abs_diff(logits_nohook, s.logits, V) == 0.0, "");
+
+  test_untied();
 
   printf("\n%s (%d failure%s)\n", failures ? "FAIL" : "PASS",
          failures, failures == 1 ? "" : "s");

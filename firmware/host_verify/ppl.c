@@ -24,7 +24,9 @@ int main(int argc, char **argv) {
 
   size_t n; uint8_t *buf = read_file(bin, &n);
   Model m; if (llm_load(buf, &m)) { fprintf(stderr, "bad magic\n"); return 1; }
-  int D = m.c.dim, L = m.c.n_layers, P = m.c.ple_dim, F = m.c.ffn, V = m.c.vocab, S = m.c.seq_len;
+  // V is the OUTPUT vocabulary: the softmax is over the logits the model
+  // produces, not over padded embedding rows it never scores.
+  int D = m.c.dim, L = m.c.n_layers, P = m.c.ple_dim, F = m.c.ffn, V = m.out_vocab, S = m.c.seq_len;
 
   Scratch s;
   s.x = malloc(D*4); s.h = malloc((F>D?F:D)*4); s.qkv = malloc(3*D*4); s.att = malloc(D*4);

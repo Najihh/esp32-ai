@@ -21,11 +21,13 @@ int main(int argc, char **argv) {
   uint8_t *buf = read_file(bin, &n);
   Model m;
   if (llm_load(buf, &m)) { fprintf(stderr, "bad magic\n"); return 1; }
-  printf("loaded: V=%d D=%d L=%d H=%d F=%d P=%d group=%d  (%.2f MB)\n",
-         m.c.vocab, m.c.dim, m.c.n_layers, m.c.n_heads, m.c.ffn, m.c.ple_dim,
-         m.c.group, n / 1e6);
+  printf("loaded: Vin=%d Vout=%d D=%d L=%d H=%d F=%d P=%d group=%d  (%.2f MB)\n",
+         m.c.vocab, m.out_vocab, m.c.dim, m.c.n_layers, m.c.n_heads, m.c.ffn,
+         m.c.ple_dim, m.c.group, n / 1e6);
 
-  int D = m.c.dim, L = m.c.n_layers, P = m.c.ple_dim, F = m.c.ffn, V = m.c.vocab, S = m.c.seq_len;
+  // V is the OUTPUT vocabulary: how many logits the model produces. The input
+  // embedding may hold more rows than that.
+  int D = m.c.dim, L = m.c.n_layers, P = m.c.ple_dim, F = m.c.ffn, V = m.out_vocab, S = m.c.seq_len;
   Scratch s;
   s.x = malloc(D * 4); s.h = malloc((F > D ? F : D) * 4);
   s.qkv = malloc(3 * D * 4); s.att = malloc(D * 4);

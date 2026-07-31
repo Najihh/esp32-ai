@@ -14,7 +14,13 @@
 #include <math.h>
 #include <string.h>
 
-#define LLM_MAGIC 0x504C4531u
+#define LLM_MAGIC 0x00454C50u        /* "PLE\0" */
+#define LLM_FORMAT_VERSION 1u
+#define LLM_FLAG_TIED_HEAD 1u        /* head is the token embedding */
+#define LLM_FLAGS_KNOWN LLM_FLAG_TIED_HEAD
+#define LLM_HEADER_BYTES 56u         /* version 1 */
+#define LLM_HEADER_MAX 4096u         /* sanity bound on a future header */
+#define LLM_MAX_LAYERS 32            /* fixed per-layer arrays below */
 #define RMS_EPS 1e-6f
 #define LLM_Q8_MAX_INPUT 4096
 
@@ -58,18 +64,20 @@ static inline float half2float(uint16_t h) {
 
 typedef struct {
   Cfg c;
-  QT tok_emb;             // [V, D]  (also the output head, tied)
+  QT tok_emb;             // [V, D]  input embedding
+  QT out_head;            // [Vout, D]; first Vout rows of tok_emb when tied
+  int out_vocab;          // logits produced per step
   QT ple_model_proj;      // [L*P, D]
   const float *ple_proj_norm; // [P]
   QT ple_table;           // [V, L*P]
-  const float *attn_norm[32]; // [D]
-  QT qkv[32];             // [3D, D]
-  QT attn_proj[32];       // [D, D]
-  const float *ffn_norm[32];  // [D]
-  QT gate[32], up[32], down[32];
-  QT ple_gate[32];        // [P, D]
-  QT ple_proj[32];        // [D, P]
-  const float *ple_norm[32];  // [D]
+  const float *attn_norm[LLM_MAX_LAYERS]; // [D]
+  QT qkv[LLM_MAX_LAYERS];             // [3D, D]
+  QT attn_proj[LLM_MAX_LAYERS];       // [D, D]
+  const float *ffn_norm[LLM_MAX_LAYERS];  // [D]
+  QT gate[LLM_MAX_LAYERS], up[LLM_MAX_LAYERS], down[LLM_MAX_LAYERS];
+  QT ple_gate[LLM_MAX_LAYERS];        // [P, D]
+  QT ple_proj[LLM_MAX_LAYERS];        // [D, P]
+  const float *ple_norm[LLM_MAX_LAYERS];  // [D]
   const float *out_norm;      // [D]
   size_t image_bytes;     // bytes consumed by the image, which is smaller than
                           // the flash partition holding it
@@ -258,12 +266,45 @@ static inline float silu(float x) { return x / (1.f + expf(-x)); }
 // Parse header + bind all tensors. Returns 0 on ok, -1 on bad magic.
 static int llm_load(const uint8_t *base, Model *m) {
   const uint8_t *p = base;
-  uint32_t magic; memcpy(&magic, p, 4); p += 4;
-  if (magic != LLM_MAGIC) return -1;
-  int32_t hv[8]; memcpy(hv, p, 32); p += 32;
-  m->c.vocab = hv[0]; m->c.dim = hv[1]; m->c.n_layers = hv[2]; m->c.n_heads = hv[3];
-  m->c.ffn = hv[4]; m->c.ple_dim = hv[5]; m->c.seq_len = hv[6]; m->c.group = hv[7];
+  uint32_t h[4]; memcpy(h, p, 16); p += 16;   /* magic, version, header_bytes, flags */
+  if (h[0] != LLM_MAGIC) return -1;
+  /* Version 0 is not a version. A newer one may have changed tensor order, so
+   * refuse rather than mis-bind. An unknown flag bit means the writer asked for
+   * behaviour this reader does not implement, which is equally unsafe. */
+  if (h[1] == 0 || h[1] > LLM_FORMAT_VERSION) return -3;
+  if (h[2] < LLM_HEADER_BYTES || h[2] > LLM_HEADER_MAX) return -2;
+  if (h[3] & ~(uint32_t)LLM_FLAGS_KNOWN) return -3;
+  uint32_t flags = h[3];
+  uint32_t vio[2]; memcpy(vio, p, 8); p += 8; /* input_vocab, output_vocab */
+  m->c.vocab = (int)vio[0];
+  m->out_vocab = (int)vio[1];
+  int32_t hv[7]; memcpy(hv, p, 28); p += 28;
+  m->c.dim = hv[0]; m->c.n_layers = hv[1]; m->c.n_heads = hv[2];
+  m->c.ffn = hv[3]; m->c.ple_dim = hv[4]; m->c.seq_len = hv[5]; m->c.group = hv[6];
   memcpy(&m->c.rope_theta, p, 4); p += 4;
+  /* Skip any fields a later version appended. */
+  p = base + h[2];
+
+  /* Every dimension below indexes a fixed array or sizes an allocation, so a
+   * malformed header must be rejected before any tensor is bound. */
+  if (m->c.vocab <= 0 || m->out_vocab <= 0 ||
+      m->c.dim <= 0 || m->c.ffn <= 0 || m->c.ple_dim <= 0 ||
+      m->c.seq_len <= 0 || m->c.group <= 0 ||
+      m->c.n_layers <= 0 || m->c.n_layers > LLM_MAX_LAYERS ||
+      m->c.n_heads <= 0 || m->c.dim % m->c.n_heads != 0 ||
+      (m->c.dim / m->c.n_heads) % 2 != 0)
+    return -2;
+  /* A tied head is a view of the first out_vocab embedding rows, so it cannot
+   * be longer than the embedding. */
+  if ((flags & LLM_FLAG_TIED_HEAD) && m->out_vocab > m->c.vocab) return -2;
+#ifdef LLM_INT8_ACT
+  /* quantize_act writes into a fixed LLM_Q8_MAX_INPUT buffer, sized by the
+   * widest matvec input: dim, ffn or ple_dim. */
+  if (m->c.dim > LLM_Q8_MAX_INPUT || m->c.ffn > LLM_Q8_MAX_INPUT ||
+      m->c.ple_dim > LLM_Q8_MAX_INPUT)
+    return -2;
+#endif
+
   m->head_matvec = NULL;
   m->layer_matvec = NULL;
   int D = m->c.dim, L = m->c.n_layers, P = m->c.ple_dim, F = m->c.ffn, V = m->c.vocab;
@@ -285,6 +326,16 @@ static int llm_load(const uint8_t *base, Model *m) {
     p = bind_f(p, &m->ple_norm[i], D);
   }
   p = bind_f(p, &m->out_norm, D);
+  /* Tied: the head is the FIRST out_vocab rows of the token embedding. The
+   * embedding may store more rows than the model can ever emit (padding above
+   * the tokenizer size), so tying does not imply equal row counts.
+   * Untied: the head is appended as the final tensor. */
+  if (flags & LLM_FLAG_TIED_HEAD) {
+    m->out_head = m->tok_emb;
+    m->out_head.rows = m->out_vocab;
+  } else {
+    p = bind_q(p, &m->out_head, m->out_vocab, D);
+  }
   m->image_bytes = (size_t)(p - base);
   return 0;
 }
@@ -484,9 +535,10 @@ static void llm_forward(Model *m, int token, int pos, Scratch *s) {
   }
 
   rmsnorm(s->x, m->out_norm, D, s->x);
-  // output head (tied embedding): logits[v] = dot(tok_emb_row[v], x)
-  if (m->head_matvec) m->head_matvec(&m->tok_emb, s->x, s->logits);
-  else MATVEC(&m->tok_emb, s->x, s->logits);
+  // output head: logits[v] = dot(out_head_row[v], x). out_head is tok_emb when
+  // the model ties them, and a separate tensor when it does not.
+  if (m->head_matvec) m->head_matvec(&m->out_head, s->x, s->logits);
+  else MATVEC(&m->out_head, s->x, s->logits);
 #ifdef LLM_PROFILE
   s->profile.head_us += (uint64_t)LLM_PROFILE_NOW() - profile_t1;
   s->profile.calls++;

@@ -9,8 +9,8 @@
 //   PSRAM   staged int8 core + head, KV   read once per position
 //   SRAM    scratch + norm vectors        touched many times per token
 //
-// The 32,768-entry logits array stays in PSRAM: 128KB is a quarter of internal
-// SRAM, and the argmax reads it once per token.
+// The logits array stays in PSRAM: 25,353 floats is 99 KiB, and the argmax
+// reads it once per token.
 //
 // Same llm.h that is verified against PyTorch on the host; only the platform
 // hooks differ here.
@@ -21,7 +21,7 @@
 
 // int8 activations, required by the staged int8 kernel. Not bit-exact against
 // the fp32 golden; verify.c must be built without this flag. Validation CE cost
-// (host_verify/ppl.c, 32,768 predictions): 2.4816 -> 2.4820, ppl 11.96 both.
+// (host_verify/ppl.c, 32,768 predictions): 2.4793 -> 2.4796, ppl 11.93 / 11.94.
 #define LLM_INT8_ACT 1
 #define LLM_PROFILE 1
 #define LLM_PROFILE_NOW() esp_timer_get_time()
@@ -130,7 +130,7 @@ static void copy_norms_to_sram() {
 
 static void alloc_scratch() {
   Cfg *c = &model.c;
-  int D = c->dim, L = c->n_layers, P = c->ple_dim, F = c->ffn, V = c->vocab, S = c->seq_len;
+  int D = c->dim, L = c->n_layers, P = c->ple_dim, F = c->ffn, S = c->seq_len;
   // hot working set -> internal SRAM
   s.x     = (float *)sram_or_die(D * 4, "x");
   s.h     = (float *)sram_or_die((F > D ? F : D) * 4, "h");
@@ -142,9 +142,9 @@ static void alloc_scratch() {
   s.tmpP  = (float *)sram_or_die(L * P * 4, "tmpP");
   s.trow  = (float *)sram_or_die(L * P * 4, "trow");
   s.scores = (float *)sram_or_die(S * 4, "scores");
-  // logits: 32,768 floats = 128KB, read once per token. Left in PSRAM rather
-  // than spend a quarter of internal SRAM on it.
-  s.logits = (float *)ps_or_die((size_t)V * 4, "logits");
+  // logits: out_vocab floats, 99 KiB here, read once per token. Left in PSRAM
+  // rather than spend a fifth of internal SRAM on it.
+  s.logits = (float *)ps_or_die((size_t)model.out_vocab * 4, "logits");
   // KV cache: 1.1MB, read once per position rather than per matvec.
   s.kcache = (float *)ps_or_die((size_t)L * S * D * 4, "kcache");
   s.vcache = (float *)ps_or_die((size_t)L * S * D * 4, "vcache");
@@ -186,18 +186,22 @@ void setup() {
 
   if (llm_load((const uint8_t *)base, &model)) { Serial.println("bad model magic"); return; }
   Cfg *c = &model.c;
-  Serial.printf("model: V=%d D=%d L=%d H=%d F=%d P=%d  (mapped %.1f MB)\n",
-                c->vocab, c->dim, c->n_layers, c->n_heads, c->ffn, c->ple_dim,
-                part->size / 1e6);
+  Serial.printf("model: Vin=%d Vout=%d D=%d L=%d H=%d F=%d P=%d  (mapped %.1f MB)\n",
+                c->vocab, model.out_vocab, c->dim, c->n_layers, c->n_heads,
+                c->ffn, c->ple_dim, part->size / 1e6);
 
 #if USE_DISPLAY
   display_begin();
 #endif
 
-  // Cap head rows to the trained vocab BEFORE staging: the tokenizer learned
-  // 25,353 entries; the padded rows above that can never be emitted (and have
-  // no decode entry), so we neither stage nor score them.
-  model.tok_emb.rows = VOCAB_N;
+  // The model header states how many logits it produces; vocab.h carries the
+  // decode table. If they disagree, every emitted token would be decoded
+  // against the wrong table.
+  if (VOCAB_N != model.out_vocab) {
+    Serial.printf("FATAL: tokenizer/model mismatch: vocab.h %d, model %d\n",
+                  VOCAB_N, model.out_vocab);
+    return;
+  }
 
   alloc_scratch();
   copy_norms_to_sram();
@@ -215,8 +219,8 @@ void setup() {
   // The tied head is read per token, not per position, so the core helper does
   // not walk it. Stage it too: it is 85%% of the dense MACs.
   {
-    void *b = ps_or_die(llm_stage_int8_bytes(&model.tok_emb), "staged head");
-    llm_stage_int8(&model.tok_emb, b);
+    void *b = ps_or_die(llm_stage_int8_bytes(&model.out_head), "staged head");
+    llm_stage_int8(&model.out_head, b);
     ++staged;
   }
   Serial.printf("weights-> PSRAM  %d tensors int8, %.2f MB allocated\n",
@@ -264,7 +268,7 @@ void setup() {
   int64_t t_start = esp_timer_get_time();
   for (int step = 0; step < N_GENERATE && pos < model.c.seq_len; step++) {
     int best = 0; float bv = -1e30f;
-    for (int v = 0; v < VOCAB_N; v++)
+    for (int v = 0; v < model.out_vocab; v++)
       if (s.logits[v] > bv) { bv = s.logits[v]; best = v; }
     tok = best;
     emit(tok);

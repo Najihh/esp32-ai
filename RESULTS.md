@@ -182,7 +182,7 @@ placement together:
 1. every per-position tensor staged to int8 in PSRAM,
 2. a dual-core `layer_matvec` hook, applied to tensors of >=128 rows
    (`ple_model_proj` 768, `qkv` 288, `ple_gate` 128),
-3. the hot working set - all scratch buffers except the 128KB logits array,
+3. the hot working set - all scratch buffers except the 99 KiB logits array,
    plus the norm vectors - in internal SRAM.
 
 | step | published | current |

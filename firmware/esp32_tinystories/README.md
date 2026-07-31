@@ -100,6 +100,6 @@ Measured on this board, 200 tokens:
 | input | 4.4 | 2.2 |
 
 The head is staged int8 and split across both LX7 cores, and is
-PSRAM-bandwidth-bound. int8 activations cost +0.0004 nats of validation CE over
-32,768 predictions (2.4816 -> 2.4820, ppl 11.96 both). The fp32 host golden
+PSRAM-bandwidth-bound. int8 activations cost +0.0003 nats of validation CE over
+32,768 predictions (2.4793 -> 2.4796, ppl 11.93 / 11.94). The fp32 host golden
 matches PyTorch to 1e-5.
