@@ -182,9 +182,9 @@ nvtx = [
 ]
 
 [[package]]
-name = "esp32-llm"
+name = "esp32-ai"
 version = "0.1.0"
-source = { virtual = "." }
+source = { editable = "." }
 dependencies = [
     { name = "numpy" },
     { name = "requests" },

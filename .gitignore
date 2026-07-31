@@ -2,6 +2,7 @@
 __pycache__/
 .venv/
 *.pyc
+*.egg-info/
 
 # data + tokenizers (regenerate with data/prepare.py)
 data/*.bin
