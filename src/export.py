@@ -20,6 +20,7 @@ correctness from quantization error, which was measured separately.
 """
 
 import os
+import shutil
 import struct
 import sys
 
@@ -33,7 +34,7 @@ from quantize import quantize_groupwise
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 RUNS = os.path.join(HERE, "..", "runs")
-OUT = os.path.join(HERE, "..", "firmware", "model")
+OUT = os.path.join(HERE, "..", "artifacts", "tinystories")
 TOK = os.path.join(HERE, "..", "data", "bpe32768.json")
 MAGIC = 0x00454C50  # "PLE\0"
 FORMAT_VERSION = 1
@@ -133,7 +134,9 @@ def main():
     out_vocab = Tokenizer.from_file(TOK).get_vocab_size()
     print(f"input_vocab={cfg.vocab_size}  output_vocab={out_vocab} (from tokenizer)")
 
-    # Write binary.
+    # Write binary. artifacts/ is gitignored, so it does not exist in a fresh
+    # clone.
+    os.makedirs(OUT, exist_ok=True)
     path = os.path.join(OUT, "model.bin")
     with open(path, "wb") as f:
         flags = FLAG_TIED_HEAD  # this model ties the head to the embedding
@@ -155,6 +158,11 @@ def main():
                 f.write(arr.tobytes())
     size = os.path.getsize(path)
     print(f"wrote {path}  ({size/1e6:.2f} MB)  {len(plan)} tensors")
+
+    # Copy the tokenizer beside the weights so the artifact directory is a
+    # complete, self-contained model: everything the firmware build and the
+    # device need, and nothing that has to be looked up elsewhere.
+    shutil.copyfile(TOK, os.path.join(OUT, "tokenizer.json"))
 
     # Keep the tied output head == dequantized input embedding. state_dict lists
     # both keys for tied weights; without this the head silently stays fp32 and

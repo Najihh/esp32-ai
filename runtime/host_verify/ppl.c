@@ -18,8 +18,12 @@ static uint8_t *read_file(const char *path, size_t *n) {
 }
 
 int main(int argc, char **argv) {
-  const char *bin = argc > 1 ? argv[1] : "firmware/model/model.bin";
-  const char *valp = argc > 2 ? argv[2] : "data/val_v32768.bin";
+  if (argc < 3) {
+    fprintf(stderr, "usage: %s <model.bin> <token-data.bin> [windows]\n", argv[0]);
+    return 2;
+  }
+  const char *bin = argv[1];
+  const char *valp = argv[2];
   int windows = argc > 3 ? atoi(argv[3]) : 8;
 
   size_t n; uint8_t *buf = read_file(bin, &n);

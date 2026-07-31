@@ -26,7 +26,7 @@
 #define LLM_PROFILE 1
 #define LLM_PROFILE_NOW() esp_timer_get_time()
 #include "../../runtime/llm.h"
-#include "vocab.h"
+#include "generated/vocab.h"
 
 // Set to 1 once a display is wired up - see display.h.
 // Leave 0 to run serial-only (no panel needed).

@@ -6,7 +6,7 @@
 // to the unstaged int8 path.
 //
 //   cc -O3 -DLLM_INT8_ACT=1 -o /tmp/sv runtime/host_verify/staging_verify.c -lm
-//   /tmp/sv firmware/model/model.bin
+//   /tmp/sv <model.bin>
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -170,7 +170,11 @@ static void test_untied(void) {
 }
 
 int main(int argc, char **argv) {
-  const char *path = argc > 1 ? argv[1] : "firmware/model/model.bin";
+  if (argc < 2) {
+    fprintf(stderr, "usage: %s <model.bin>\n", argv[0]);
+    return 2;
+  }
+  const char *path = argv[1];
   FILE *f = fopen(path, "rb");
   if (!f) { fprintf(stderr, "cannot open %s\n", path); return 2; }
   fseek(f, 0, SEEK_END); long sz = ftell(f); fseek(f, 0, SEEK_SET);

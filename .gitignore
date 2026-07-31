@@ -11,13 +11,13 @@ data/*.json
 # training outputs
 runs/
 
-# generated firmware artifacts (regenerate with src/export.py, src/gen_assets.py)
-firmware/model/model.bin
-firmware/model/golden.npz
-firmware/model/golden.txt
-firmware/esp32_tinystories/vocab.h
+# model artifacts: fetched from the model registry or written by src/export.py
+/artifacts/
 
-# raw video / recordings (demo footage — keep out of the repo)
+# headers each sketch generates from those artifacts
+firmware/**/generated/
+
+# raw video / recordings (demo footage - keep out of the repo)
 video/
 videos/
 *.mp4

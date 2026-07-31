@@ -15,8 +15,12 @@ static uint8_t *read_file(const char *path, size_t *n) {
 }
 
 int main(int argc, char **argv) {
-  const char *bin = argc > 1 ? argv[1] : "firmware/model/model.bin";
-  const char *gold = argc > 2 ? argv[2] : "firmware/model/golden.txt";
+  if (argc < 3) {
+    fprintf(stderr, "usage: %s <model.bin> <golden.txt>\n", argv[0]);
+    return 2;
+  }
+  const char *bin = argv[1];
+  const char *gold = argv[2];
   size_t n;
   uint8_t *buf = read_file(bin, &n);
   Model m;

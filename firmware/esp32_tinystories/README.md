@@ -21,19 +21,30 @@ The steps below are what the script does, for running a piece of it by hand.
 
 ```bash
 cc -O3 -Wall -Wextra -o /tmp/verify runtime/host_verify/verify.c -lm
-/tmp/verify firmware/model/model.bin firmware/model/golden.txt
+/tmp/verify artifacts/tinystories/model.bin artifacts/tinystories/golden.txt
 
 cc -O3 -Wall -Wextra -DLLM_INT8_ACT=1 -o /tmp/staging runtime/host_verify/staging_verify.c -lm
-/tmp/staging firmware/model/model.bin
+/tmp/staging artifacts/tinystories/model.bin
 ```
 
 The first checks the exact int4 path against the PyTorch golden; the second the
 staged int8 kernel and platform hooks, which is what the device runs.
 
-To regenerate the model itself:
+Every host tool takes explicit paths; none assumes a model location.
+
+To rebuild the decode header from a tokenizer, which `deploy.sh` does on every
+run so a stale header cannot survive a tokenizer change:
 
 ```bash
-uv run python src/export.py
+uv run python firmware/esp32_tinystories/tools/generate_vocab.py \
+  --tokenizer artifacts/tinystories/tokenizer.json \
+  --out firmware/esp32_tinystories/generated/vocab.h
+```
+
+To regenerate the model artifacts from a checkpoint:
+
+```bash
+uv run python src/export.py <checkpoint-tag>
 ```
 
 Build the device firmware with Arduino ESP32 core 3.3.10:
@@ -58,7 +69,7 @@ arduino-cli upload \
   firmware/esp32_tinystories
 
 esptool.py --chip esp32s3 --port /dev/cu.usbmodem2101 --baud 921600 \
-  write_flash 0x110000 firmware/model/model.bin
+  write_flash 0x110000 artifacts/tinystories/model.bin
 
 arduino-cli monitor -p /dev/cu.usbmodem2101 --config baudrate=115200
 ```

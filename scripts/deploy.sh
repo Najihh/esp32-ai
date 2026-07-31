@@ -10,9 +10,14 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
-# TinyStories artifact paths.
+# TinyStories artifact paths. artifacts/ holds downloaded or exported model
+# files and is ignored; generated/ holds headers built from them.
 SKETCH=firmware/esp32_tinystories
-MODEL=${MODEL:-firmware/model/model.bin}
+ARTIFACTS=${ARTIFACTS:-artifacts/tinystories}
+MODEL=${MODEL:-$ARTIFACTS/model.bin}
+TOKENIZER=${TOKENIZER:-$ARTIFACTS/tokenizer.json}
+GOLDEN=${GOLDEN:-$ARTIFACTS/golden.txt}
+VOCAB_H=$SKETCH/generated/vocab.h
 PART_OFFSET=0x110000
 
 FQBN='esp32:esp32:esp32s3:UploadSpeed=921600,USBMode=hwcdc,CDCOnBoot=cdc,UploadMode=default,CPUFreq=240,FlashMode=qio,FlashSize=16M,PartitionScheme=custom,PSRAM=opi,DebugLevel=info'
@@ -47,17 +52,35 @@ PORT=${PORT:-$(ls /dev/cu.usbmodem* 2>/dev/null | head -1 || true)}
 [ -n "$PORT" ] || { echo "no /dev/cu.usbmodem* found; plug the board in, or set PORT=..." >&2; exit 1; }
 
 test -f "$MODEL" || {
-  echo "$MODEL missing (gitignored, 14.9 MB)." >&2
-  echo "Regenerate with: uv run python src/export.py" >&2
+  echo "$MODEL missing." >&2
+  echo "Fetch the released model into $ARTIFACTS/, or export one with:" >&2
+  echo "  uv run python src/export.py <checkpoint-tag>" >&2
   exit 1; }
-test -f firmware/esp32_tinystories/vocab.h || {
-  echo "vocab.h missing; run: uv run python src/gen_assets.py" >&2; exit 1; }
+test -f "$TOKENIZER" || {
+  echo "$TOKENIZER missing. The decode table is built from it, so it must ship" >&2
+  echo "with the model." >&2
+  exit 1; }
+
+# Rebuild the decode header from the tokenizer being deployed, every time. The
+# firmware only checks that VOCAB_N equals the model's output_vocab, so a stale
+# header from a different tokenizer with the same entry count would pass that
+# check and decode every token wrongly.
+echo "=== generate $VOCAB_H from $TOKENIZER ==="
+uv run python "$SKETCH/tools/generate_vocab.py" \
+  --tokenizer "$TOKENIZER" --out "$VOCAB_H" 2>&1 | grep wrote
 
 CFLAGS='-O3 -Wall -Wextra'
 
-echo "=== host verify: exact int4 path vs PyTorch golden ==="
-cc $CFLAGS -o /tmp/llm_verify runtime/host_verify/verify.c -lm
-/tmp/llm_verify "$MODEL" firmware/model/golden.txt 2>&1 | tail -2
+# The golden is produced by src/export.py and is not part of a released model,
+# so a clone that only fetched model.bin will not have one. Skip visibly rather
+# than fail: staging_verify below needs no golden and still runs.
+if [ -f "$GOLDEN" ]; then
+  echo "=== host verify: exact int4 path vs PyTorch golden ==="
+  cc $CFLAGS -o /tmp/llm_verify runtime/host_verify/verify.c -lm
+  /tmp/llm_verify "$MODEL" "$GOLDEN" 2>&1 | tail -2
+else
+  echo "=== host verify: SKIPPED, no golden at $GOLDEN ==="
+fi
 
 # The device runs the staged int8 kernel through the platform hooks. verify.c
 # does not reach that code - it exercises the exact int4 path - so without
