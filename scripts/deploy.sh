@@ -11,7 +11,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
 # TinyStories artifact paths.
-SKETCH=firmware/esp32_llm
+SKETCH=firmware/esp32_tinystories
 MODEL=${MODEL:-firmware/model/model.bin}
 PART_OFFSET=0x110000
 
@@ -50,7 +50,7 @@ test -f "$MODEL" || {
   echo "$MODEL missing (gitignored, 14.9 MB)." >&2
   echo "Regenerate with: uv run python src/export.py" >&2
   exit 1; }
-test -f firmware/esp32_llm/vocab.h || {
+test -f firmware/esp32_tinystories/vocab.h || {
   echo "vocab.h missing; run: uv run python src/gen_assets.py" >&2; exit 1; }
 
 CFLAGS='-O3 -Wall -Wextra'

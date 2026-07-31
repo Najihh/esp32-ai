@@ -1,5 +1,5 @@
 """Generate on-device assets for the ESP32 sketch:
-  - firmware/esp32_llm/vocab.h : token id -> raw UTF-8 bytes, so the device just
+  - firmware/esp32_tinystories/vocab.h : token id -> raw UTF-8 bytes, so the device just
     Serial.write()s the bytes of each generated token (llama2.c style).
   - prints the prompt token ids for a fixed demo prompt to paste into the sketch.
 """
@@ -10,7 +10,7 @@ from tokenizers import Tokenizer
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 TOK = os.path.join(HERE, "..", "data", "bpe32768.json")
-OUT = os.path.join(HERE, "..", "firmware", "esp32_llm", "vocab.h")
+OUT = os.path.join(HERE, "..", "firmware", "esp32_tinystories", "vocab.h")
 PROMPT = "Once upon a time"
 
 

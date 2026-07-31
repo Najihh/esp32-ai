@@ -43,7 +43,7 @@ arduino-cli compile \
   --fqbn 'esp32:esp32:esp32s3:UploadSpeed=921600,USBMode=hwcdc,CDCOnBoot=cdc,UploadMode=default,CPUFreq=240,FlashMode=qio,FlashSize=16M,PartitionScheme=custom,PSRAM=opi,DebugLevel=info' \
   --build-property compiler.optimization_flags=-O3 \
   --build-path /tmp/esp32-llm-build \
-  firmware/esp32_llm
+  firmware/esp32_tinystories
 ```
 
 ## Flash and run
@@ -55,7 +55,7 @@ arduino-cli upload \
   -p /dev/cu.usbmodem2101 \
   --fqbn 'esp32:esp32:esp32s3:UploadSpeed=921600,USBMode=hwcdc,CDCOnBoot=cdc,UploadMode=default,CPUFreq=240,FlashMode=qio,FlashSize=16M,PartitionScheme=custom,PSRAM=opi,DebugLevel=info' \
   --input-dir /tmp/esp32-llm-build \
-  firmware/esp32_llm
+  firmware/esp32_tinystories
 
 esptool.py --chip esp32s3 --port /dev/cu.usbmodem2101 --baud 921600 \
   write_flash 0x110000 firmware/model/model.bin
