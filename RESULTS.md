@@ -149,7 +149,7 @@ compute-bound**: it reads 2.43MB of int8 weights per token, which at 60.7 MB/s i
 a ~40ms floor, so only ~17ms is compute. Literal S3 vector-SIMD would cut that
 17ms but not the 40ms bandwidth floor (bounded ~15% further gain). The bigger
 levers from here are reducing bytes-read (int4 head + SIMD unpack) or a
-smaller/factorised output head (a model change) -- not vectorising harder.
+smaller/factorised output head (a model change) - not vectorising harder.
 
 The earlier fp32 exact optimizations (139.4ms baseline) were: staging the head
 in PSRAM, converting each fp16 group scale once, unpacking both int4 values per
@@ -171,9 +171,40 @@ wall share):
 | PLE input + per-layer path | 12.9 | 9.3% |
 | FFN | 6.9 | 4.9% |
 
-Explicitly staging the remaining 0.29MB quantized core in PSRAM and norms in
-internal RAM saved only 2.0ms/token (1.4%) while adding allocation complexity,
-so that experiment was removed from the polished runtime.
+An earlier core-staging configuration - the 0.29MB quantized core in PSRAM and
+norms in internal RAM - improved latency by 2.0ms/token (1.4%).
+
+### Current runtime
+
+The current configuration enables staging, layer parallelism and SRAM hot-set
+placement together:
+
+1. every per-position tensor staged to int8 in PSRAM,
+2. a dual-core `layer_matvec` hook, applied to tensors of >=128 rows
+   (`ple_model_proj` 768, `qkv` 288, `ple_gate` 128),
+3. the hot working set - all scratch buffers except the 128KB logits array,
+   plus the norm vectors - in internal SRAM.
+
+| step | published | current |
+|---|---:|---:|
+| output head | 57.6 | 59.4 |
+| attention | 25.6 | 20.5 |
+| PLE path | 8.5 | 6.4 |
+| FFN | 6.9 | 6.5 |
+| input | 4.4 | 2.2 |
+| **total ms/token** | **102.9** | **94.9** |
+
+The combined configuration reduces compute latency from 102.9 to 94.9ms/token
+(9.88 tok/s attached). Individual contributions were not isolated.
+
+Managed hot set: 29,320B internal (21,128 dynamic + 8,192 static), 294KB
+internal free, 4.22MB PSRAM.
+
+`matvec_i8_range` must stay out of line: inlining it regressed inference from
+95.0 to 155.2ms/token on Arduino ESP32 3.3.10 at -O3.
+
+Global `-O3` is set by `scripts/deploy.sh` and is the entire optimization
+configuration; the runtime carries no per-function optimization attributes.
 
 There is still bounded exact work—parallel attention, precomputed RoPE
 frequencies, and a one-group-specialized head loop—but the profile caps the

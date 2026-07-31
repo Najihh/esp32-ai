@@ -45,9 +45,11 @@ That idea is Google's Per-Layer Embeddings, from Gemma 3n and Gemma 4. Here it r
 on the memory layout of a microcontroller instead of a phone or a GPU. As far as I
 can tell, nobody had tried it on a chip this small.
 
+Each tier holds whatever is read at its own frequency:
+
 ```
-  SRAM  (fast, tiny)   the "thinking" core, used on every token
-  PSRAM (medium)       the output head and working memory
+  SRAM  (fast, tiny)   activations and norm weights, touched many times a token
+  PSRAM (medium)       the core and output head, read once per position
   FLASH (huge, slow)   the 25M-param table, about 6 rows read per token (~450 B)
 ```
 
@@ -80,9 +82,6 @@ Andrej Karpathy's [llama2.c](https://github.com/karpathy/llama2.c) is why a lot 
 people, me included, believe you can train a tiny language model and run it in plain
 C at all. This grew out of that.
 
-## How this actually went
+## Measurements
 
-I left the messy history in the repo on purpose. That includes a bug I found in my
-own parameter accounting, which had inflated an early number, and the corrected
-result that followed once I fixed it. The commit history and `RESULTS.md` show where
-the numbers moved and why.
+Detailed measurements and ablations are documented in `RESULTS.md`.
