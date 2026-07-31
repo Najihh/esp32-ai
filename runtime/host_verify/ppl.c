@@ -6,7 +6,7 @@
 #include <stdlib.h>
 #include <stdint.h>
 #include <math.h>
-#include "../common/llm.h"
+#include "../llm.h"
 
 static uint8_t *read_file(const char *path, size_t *n) {
   FILE *f = fopen(path, "rb");

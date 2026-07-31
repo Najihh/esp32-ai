@@ -21,11 +21,11 @@
 
 // int8 activations, required by the staged int8 kernel. Not bit-exact against
 // the fp32 golden; verify.c must be built without this flag. Validation CE cost
-// (host_verify/ppl.c, 32,768 predictions): 2.4793 -> 2.4796, ppl 11.93 / 11.94.
+// (runtime/host_verify/ppl.c, 32,768 predictions): 2.4793 -> 2.4796, ppl 11.93 / 11.94.
 #define LLM_INT8_ACT 1
 #define LLM_PROFILE 1
 #define LLM_PROFILE_NOW() esp_timer_get_time()
-#include "../common/llm.h"
+#include "../../runtime/llm.h"
 #include "vocab.h"
 
 // Set to 1 once a display is wired up - see display.h.

@@ -56,14 +56,14 @@ test -f firmware/esp32_tinystories/vocab.h || {
 CFLAGS='-O3 -Wall -Wextra'
 
 echo "=== host verify: exact int4 path vs PyTorch golden ==="
-cc $CFLAGS -o /tmp/llm_verify firmware/host_verify/verify.c -lm
+cc $CFLAGS -o /tmp/llm_verify runtime/host_verify/verify.c -lm
 /tmp/llm_verify "$MODEL" firmware/model/golden.txt 2>&1 | tail -2
 
 # The device runs the staged int8 kernel through the platform hooks. verify.c
 # does not reach that code - it exercises the exact int4 path - so without
 # this the thing actually executing on the board has no host gate.
 echo "=== host verify: int8 staging + platform hooks ==="
-cc $CFLAGS -DLLM_INT8_ACT=1 -o /tmp/llm_staging firmware/host_verify/staging_verify.c -lm
+cc $CFLAGS -DLLM_INT8_ACT=1 -o /tmp/llm_staging runtime/host_verify/staging_verify.c -lm
 /tmp/llm_staging "$MODEL" 2>&1 | tail -3
 
 # Compile and verify before writing either image: a build failure after the

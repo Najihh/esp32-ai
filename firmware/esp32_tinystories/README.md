@@ -20,10 +20,10 @@ The steps below are what the script does, for running a piece of it by hand.
 ### Host gates
 
 ```bash
-cc -O3 -Wall -Wextra -o /tmp/verify firmware/host_verify/verify.c -lm
+cc -O3 -Wall -Wextra -o /tmp/verify runtime/host_verify/verify.c -lm
 /tmp/verify firmware/model/model.bin firmware/model/golden.txt
 
-cc -O3 -Wall -Wextra -DLLM_INT8_ACT=1 -o /tmp/staging firmware/host_verify/staging_verify.c -lm
+cc -O3 -Wall -Wextra -DLLM_INT8_ACT=1 -o /tmp/staging runtime/host_verify/staging_verify.c -lm
 /tmp/staging firmware/model/model.bin
 ```
 

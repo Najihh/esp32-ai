@@ -5,13 +5,13 @@
 // Staging unpacks the same nibbles and scales, so results must be bit-identical
 // to the unstaged int8 path.
 //
-//   cc -O3 -DLLM_INT8_ACT=1 -o /tmp/sv firmware/host_verify/staging_verify.c -lm
+//   cc -O3 -DLLM_INT8_ACT=1 -o /tmp/sv runtime/host_verify/staging_verify.c -lm
 //   /tmp/sv firmware/model/model.bin
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include "../common/llm.h"
+#include "../llm.h"
 
 static int failures = 0;
 

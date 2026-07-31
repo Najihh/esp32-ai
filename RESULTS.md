@@ -82,7 +82,7 @@ favourable regime; the small-vocab ablation is a control, not the product.
 
 ## Hardware: bandwidth measured on the N16R8 (2026-07-21)
 
-Measured on the real ESP32-S3 (`firmware/bandwidth_bench`, cycle-accurate timing
+Measured on the real ESP32-S3 (`firmware/benchmarks/bandwidth`, cycle-accurate timing
 via the Xtensa cycle counter). This is what turns the estimated tok/s into a real
 one, and it is the number the whole approach rested on.
 
@@ -139,7 +139,7 @@ a further 1.35x over the exact fp32 dual-core head. The output head is staged as
 int8 in PSRAM once at boot (int4 nibbles unpacked once), and activations are
 quantized to int8 per token, so each output row is a plain int8xint8 -> int32 dot
 with no per-token unpacking. **The int8-activation change was validated on host
-val perplexity (delta ~0, see firmware/host_verify/ppl.c) before shipping**, and
+val perplexity (delta ~0, see runtime/host_verify/ppl.c) before shipping**, and
 on-chip text stays coherent. The scalar fp32 head (139.4ms) remains the exact
 baseline; the fp32 host golden still matches PyTorch to 1e-5.
 

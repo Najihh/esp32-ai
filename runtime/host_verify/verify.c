@@ -3,7 +3,7 @@
 // If these match to fp tolerance, the C port is correct and can go to the ESP32.
 #include <stdio.h>
 #include <stdlib.h>
-#include "../common/llm.h"
+#include "../llm.h"
 
 static uint8_t *read_file(const char *path, size_t *n) {
   FILE *f = fopen(path, "rb");
