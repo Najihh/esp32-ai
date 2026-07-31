@@ -1,18 +1,34 @@
 // PLE TinyLM inference on the ESP32-S3.
+//
 // The 28.9M-param model (14.9MB, 4-bit) lives in a flash 'model' partition,
-// memory-mapped so the 25M table is read a row at a time from flash; the hot
-// tied head plus scratch and KV cache sit in PSRAM. Same llm.h that was verified
-// against PyTorch on the host -- only the platform hooks differ here.
+// memory-mapped. Placement follows reads-per-token rather than what happens to
+// fit:
+//
+//   flash   PLE table + token embedding   one row of the 25.2M-parameter
+//                                         table per token
+//   PSRAM   staged int8 core + head, KV   read once per position
+//   SRAM    scratch + norm vectors        touched many times per token
+//
+// The 32,768-entry logits array stays in PSRAM: 128KB is a quarter of internal
+// SRAM, and the argmax reads it once per token.
+//
+// Same llm.h that is verified against PyTorch on the host; only the platform
+// hooks differ here.
 
 #include "esp_partition.h"
 #include "esp_heap_caps.h"
 #include "esp_timer.h"
+
+// int8 activations, required by the staged int8 kernel. Not bit-exact against
+// the fp32 golden; verify.c must be built without this flag. Validation CE cost
+// (host_verify/ppl.c, 32,768 predictions): 2.4816 -> 2.4820, ppl 11.96 both.
+#define LLM_INT8_ACT 1
 #define LLM_PROFILE 1
 #define LLM_PROFILE_NOW() esp_timer_get_time()
 #include "../common/llm.h"
 #include "vocab.h"
 
-// Set to 1 once a GMT020-02-7P (2.0" 240x320 ST7789) is wired up — see display.h.
+// Set to 1 once a display is wired up - see display.h.
 // Leave 0 to run serial-only (no panel needed).
 #define USE_DISPLAY 1
 #if USE_DISPLAY
@@ -22,7 +38,125 @@
 static const int PROMPT_IDS[] = {433, 447, 259, 405}; // "Once upon a time"
 static const int N_GENERATE = 200;
 
-// Emit one token to every active output (serial always; TFT when enabled).
+Model model;
+Scratch s;
+
+// ---- allocation ------------------------------------------------------------
+// Allocations are strict because memory placement is part of the runtime
+// configuration. Allocation failure stops initialization.
+static size_t psram_used = 0, sram_used = 0;
+
+// The two LLM_Q8_MAX_INPUT int8 activation buffers (matvec_q8, matvec_par),
+// which are static and so absent from the totals above. Together these report
+// the managed hot set, not total SRAM usage; the free-SRAM figure printed at
+// boot is the overall diagnostic.
+#define STATIC_SRAM_BYTES (2 * LLM_Q8_MAX_INPUT)
+
+static void *ps(size_t n) {
+  void *p = heap_caps_malloc(n, MALLOC_CAP_SPIRAM);
+  if (p) psram_used += n;
+  return p;
+}
+static void *ps_or_die(size_t n, const char *what) {
+  void *p = ps(n);
+  if (!p) {
+    Serial.printf("FATAL: required PSRAM allocation failed: %s (%u bytes)\n",
+                  what, (unsigned)n);
+    while (1) delay(1000);
+  }
+  return p;
+}
+static void *sram_or_die(size_t n, const char *what) {
+  void *p = heap_caps_malloc(n, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+  if (!p) {
+    Serial.printf("FATAL: required SRAM allocation failed: %s (%u bytes)\n",
+                  what, (unsigned)n);
+    while (1) delay(1000);
+  }
+  sram_used += n;
+  return p;
+}
+
+// ---- dual-core int8 matvec -------------------------------------------------
+// Serves both hooks. Below ~128 rows the task notify round trip costs more than
+// the split saves, so small tensors run single-core.
+static TaskHandle_t worker_h, main_h;
+static const QT *job_t;
+static const int8_t *job_xq;
+static float job_xs;
+static float *job_y;
+static int job_split;
+
+static void worker_main(void *) {
+  for (;;) {
+    ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+    matvec_i8_range(job_t, job_xq, job_xs, job_y, 0, job_split);
+    xTaskNotifyGive(main_h);
+  }
+}
+
+static void matvec_par(const QT *t, const float *x, float *y) {
+  static int8_t xq[LLM_Q8_MAX_INPUT];
+  float xs;
+  if (t->w8 == NULL || t->rows < 128) { MATVEC(t, x, y); return; }
+  quantize_act(x, t->cols, xq, &xs);   // once; both cores read the result
+  job_t = t; job_xq = xq; job_xs = xs; job_y = y; job_split = t->rows / 2;
+  xTaskNotifyGive(worker_h);
+  matvec_i8_range(t, xq, xs, y, job_split, t->rows);
+  ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+}
+
+// Copy RMSNorm weights from mapped flash to internal SRAM.
+static void copy_norms_to_sram() {
+  Cfg *c = &model.c;
+  int D = c->dim, L = c->n_layers, P = c->ple_dim;
+  const float **vecs[3 * 32 + 2];
+  int sizes[3 * 32 + 2], n_vec = 0;
+  vecs[n_vec] = &model.ple_proj_norm; sizes[n_vec++] = P;
+  for (int l = 0; l < L; l++) {
+    vecs[n_vec] = &model.attn_norm[l]; sizes[n_vec++] = D;
+    vecs[n_vec] = &model.ffn_norm[l];  sizes[n_vec++] = D;
+    vecs[n_vec] = &model.ple_norm[l];  sizes[n_vec++] = D;
+  }
+  vecs[n_vec] = &model.out_norm; sizes[n_vec++] = D;
+  for (int i = 0; i < n_vec; i++) {
+    size_t bytes = (size_t)sizes[i] * sizeof(float);
+    void *dst = sram_or_die(bytes, "norm vector");
+    memcpy(dst, *vecs[i], bytes);
+    *vecs[i] = (const float *)dst;
+  }
+  Serial.printf("norms  -> SRAM   %d vectors\n", n_vec);
+}
+
+static void alloc_scratch() {
+  Cfg *c = &model.c;
+  int D = c->dim, L = c->n_layers, P = c->ple_dim, F = c->ffn, V = c->vocab, S = c->seq_len;
+  // hot working set -> internal SRAM
+  s.x     = (float *)sram_or_die(D * 4, "x");
+  s.h     = (float *)sram_or_die((F > D ? F : D) * 4, "h");
+  s.qkv   = (float *)sram_or_die(3 * D * 4, "qkv");
+  s.att   = (float *)sram_or_die(D * 4, "att");
+  s.g1    = (float *)sram_or_die(F * 4, "g1");
+  s.g2    = (float *)sram_or_die((P > F ? P : F) * 4, "g2");
+  s.ple   = (float *)sram_or_die(L * P * 4, "ple");
+  s.tmpP  = (float *)sram_or_die(L * P * 4, "tmpP");
+  s.trow  = (float *)sram_or_die(L * P * 4, "trow");
+  s.scores = (float *)sram_or_die(S * 4, "scores");
+  // logits: 32,768 floats = 128KB, read once per token. Left in PSRAM rather
+  // than spend a quarter of internal SRAM on it.
+  s.logits = (float *)ps_or_die((size_t)V * 4, "logits");
+  // KV cache: 1.1MB, read once per position rather than per matvec.
+  s.kcache = (float *)ps_or_die((size_t)L * S * D * 4, "kcache");
+  s.vcache = (float *)ps_or_die((size_t)L * S * D * 4, "vcache");
+}
+
+static void blink(uint8_t g) {
+#ifdef RGB_BUILTIN
+  rgbLedWrite(RGB_BUILTIN, 0, g, g / 3);
+#endif
+}
+
+// Emit one token to every active output (serial always; panel when enabled).
 static void emit(int tok) {
   if (tok >= VOCAB_N) return;
   const unsigned char *bytes = VOCAB_BLOB + VOCAB_OFF[tok];
@@ -36,98 +170,11 @@ static void emit(int tok) {
 #endif
 }
 
-Model model;
-Scratch s;
-
-// ---- int8 output head (SIMD-friendly) --------------------------------------
-// The head is scanned in full every token and dominates runtime. We stage it as
-// int8 in PSRAM at boot (int4 nibbles unpacked ONCE), so per token there is no
-// nibble unpacking and no float conversion of weights -- just int8 x int8 ->
-// int32 dot per row. Its input dim (D=96) is a single group, so one scale per
-// row. int8-activation quality was validated on host (val perplexity delta ~0,
-// see firmware/host_verify/ppl.c). Output rows split across both LX7 cores.
-static int8_t *head_w8 = NULL;      // [rows * cols] unpacked int8 weights (-7..7)
-static float  *head_scale8 = NULL;  // [rows] per-row dequant scale
-static int head_rows, head_cols;
-
-static int8_t head_actq[128];       // quantized activation, shared by both cores
-static float  head_acts;            // its scale
-
-// int8 dot -> int32. Tight and branch-free so the S3 int SIMD / -O3 unrolls it.
-static inline int32_t dot_i8(const int8_t *a, const int8_t *b, int n) {
-  int32_t acc = 0;
-  for (int i = 0; i < n; i++) acc += (int32_t)a[i] * (int32_t)b[i];
-  return acc;
-}
-
-static void head_rows_range(float *y, int r0, int r1) {
-  for (int r = r0; r < r1; r++)
-    y[r] = (float)dot_i8(head_actq, head_w8 + (size_t)r * head_cols, head_cols)
-           * head_scale8[r] * head_acts;
-}
-
-// dual-core plumbing (worker does the first half of the rows on core 0)
-static TaskHandle_t head_worker;
-static TaskHandle_t inference_task;
-static float *volatile head_job_y;
-static volatile int head_job_split;
-
-static void head_worker_main(void *) {
-  for (;;) {
-    ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
-    head_rows_range(head_job_y, 0, head_job_split);
-    xTaskNotifyGive(inference_task);
-  }
-}
-
-// Matches Model.head_matvec (QT*, float*, float*); QT unused (weights staged).
-static void head_matvec_int8(const QT *t, const float *x, float *y) {
-  (void)t;
-  quantize_act(x, head_cols, head_actq, &head_acts);  // once; both cores read it
-  head_job_y = y;
-  head_job_split = head_rows / 2;
-  xTaskNotifyGive(head_worker);
-  head_rows_range(y, head_job_split, head_rows);
-  ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
-}
-
-static void *ps(size_t n) {
-  void *p = heap_caps_malloc(n, MALLOC_CAP_SPIRAM);
-  if (!p) { Serial.printf("PSRAM alloc failed (%u bytes)\n", (unsigned)n); while (1) delay(1000); }
-  return p;
-}
-
-// Unpack the (row-capped) head from int4 to int8 in PSRAM, once at boot.
-static void stage_head_int8(QT *t) {
-  head_rows = t->rows; head_cols = t->cols;
-  head_w8 = (int8_t *)ps((size_t)head_rows * head_cols);
-  head_scale8 = (float *)ps((size_t)head_rows * sizeof(float));
-  for (int r = 0; r < head_rows; r++) {
-    const uint8_t *row = t->codes + (size_t)r * t->row_bytes;
-    int8_t *dst = head_w8 + (size_t)r * head_cols;
-    for (int j = 0; j < head_cols; j++) {
-      uint8_t byte = row[j >> 1];
-      int code = (j & 1) ? (byte >> 4) : (byte & 0xF);
-      dst[j] = (int8_t)(code - 8);
-    }
-    head_scale8[r] = half2float(t->scales[(size_t)r * t->n_groups]);  // n_groups==1
-  }
-  Serial.printf("head staged int8: %.2f MB\n",
-                ((size_t)head_rows * head_cols + (size_t)head_rows * 4) / 1e6);
-}
-
-static void blink(uint8_t g) {
-#ifdef RGB_BUILTIN
-  rgbLedWrite(RGB_BUILTIN, 0, g, g / 3);
-#endif
-}
-
 void setup() {
   Serial.begin(115200);
   delay(1500);
   Serial.println("\n=== ESP32-S3 PLE TinyLM ===");
 
-  // Map the model partition.
   const esp_partition_t *part = esp_partition_find_first(
       ESP_PARTITION_TYPE_DATA, (esp_partition_subtype_t)0x40, "model");
   if (!part) { Serial.println("model partition not found"); return; }
@@ -148,40 +195,61 @@ void setup() {
 #endif
 
   // Cap head rows to the trained vocab BEFORE staging: the tokenizer learned
-  // 25,353 entries; the padded rows above that can never be emitted (and have no
-  // decode entry), so we neither stage nor score them.
+  // 25,353 entries; the padded rows above that can never be emitted (and have
+  // no decode entry), so we neither stage nor score them.
   model.tok_emb.rows = VOCAB_N;
-  stage_head_int8(&model.tok_emb);  // int8-staged head; input embedding still uses mmap
-  inference_task = xTaskGetCurrentTaskHandle();
-  if (xTaskCreatePinnedToCore(head_worker_main, "head", 4096, NULL, 2,
-                             &head_worker, 0) != pdPASS) {
-    Serial.println("head worker creation failed");
-    return;
-  }
-  model.head_matvec = head_matvec_int8;
 
-  int D = c->dim, L = c->n_layers, P = c->ple_dim, F = c->ffn, V = c->vocab, S = c->seq_len;
-  s.x = (float *)ps(D * 4);
-  s.h = (float *)ps((F > D ? F : D) * 4);
-  s.qkv = (float *)ps(3 * D * 4);
-  s.att = (float *)ps(D * 4);
-  s.g1 = (float *)ps(F * 4);
-  s.g2 = (float *)ps((P > F ? P : F) * 4);
-  s.ple = (float *)ps(L * P * 4);
-  s.tmpP = (float *)ps(L * P * 4);
-  s.trow = (float *)ps(L * P * 4);
-  s.logits = (float *)ps(V * 4);
-  s.scores = (float *)ps(S * 4);
-  s.kcache = (float *)ps((size_t)L * S * D * 4);
-  s.vcache = (float *)ps((size_t)L * S * D * 4);
-  Serial.printf("PSRAM free after alloc: %u KB\n\n",
-                heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024);
+  alloc_scratch();
+  copy_norms_to_sram();
+  Serial.printf("hot set-> SRAM   %u B dynamic + %u B static = %u B managed\n",
+                (unsigned)sram_used, (unsigned)STATIC_SRAM_BYTES,
+                (unsigned)(sram_used + STATIC_SRAM_BYTES));
+
+  // Stage every per-position tensor to int8 in PSRAM.
+  int want = llm_core_stage_count(&model);
+  int staged = llm_stage_core_int8_alloc(&model, ps);
+  if (staged != want) {
+    Serial.printf("FATAL: staged %d/%d core tensors\n", staged, want);
+    while (1) delay(1000);
+  }
+  // The tied head is read per token, not per position, so the core helper does
+  // not walk it. Stage it too: it is 85%% of the dense MACs.
+  {
+    void *b = ps_or_die(llm_stage_int8_bytes(&model.tok_emb), "staged head");
+    llm_stage_int8(&model.tok_emb, b);
+    ++staged;
+  }
+  Serial.printf("weights-> PSRAM  %d tensors int8, %.2f MB allocated\n",
+                staged, psram_used / 1048576.0);
+
+  main_h = xTaskGetCurrentTaskHandle();
+  if (xTaskCreatePinnedToCore(worker_main, "mv", 4096, NULL, 2, &worker_h, 0) == pdPASS) {
+    // After the worker exists: matvec_par notifies worker_h.
+    model.layer_matvec = matvec_par;
+    model.head_matvec  = matvec_par;
+  } else {
+    Serial.println("dual-core worker failed; running single core");
+  }
+
+  // FNV-1a over the mapped image. scripts/deploy.sh prints the same value for
+  // the file it flashed; the two must agree.
+  {
+    const uint8_t *img = (const uint8_t *)base;
+    uint32_t fp = 2166136261u;
+    for (size_t i = 0; i < model.image_bytes; i++) { fp ^= img[i]; fp *= 16777619u; }
+    Serial.printf("build: bytes=%u fp=%08x sram=%uB psram=%.2fMB\n",
+                  (unsigned)model.image_bytes, fp,
+                  (unsigned)(sram_used + STATIC_SRAM_BYTES),
+                  psram_used / 1048576.0);
+  }
+  Serial.printf("free: sram %.0f KB | psram %.2f MB\n\n",
+                heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024.0,
+                heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1048576.0);
 
   // ---- generate ----
   Serial.print(">>> ");
   int n_prompt = sizeof(PROMPT_IDS) / sizeof(int);
   int pos = 0, tok = 0;
-  int64_t t_start = 0;
   int64_t decode_us = 0;
   int decoded = 0;
 
@@ -193,9 +261,8 @@ void setup() {
 
   llm_profile_reset(&s);
 
-  t_start = esp_timer_get_time();
+  int64_t t_start = esp_timer_get_time();
   for (int step = 0; step < N_GENERATE && pos < model.c.seq_len; step++) {
-    // greedy: argmax over the trained vocab
     int best = 0; float bv = -1e30f;
     for (int v = 0; v < VOCAB_N; v++)
       if (s.logits[v] > bv) { bv = s.logits[v]; best = v; }
@@ -207,7 +274,7 @@ void setup() {
     llm_forward(&model, tok, pos++, &s);
     decode_us += esp_timer_get_time() - d0;
     decoded++;
-    if ((step & 7) == 0) delay(0);  // feed the task WDT ~every 8 tokens (~1.1s), near-free
+    if ((step & 7) == 0) delay(0);  // feed the task WDT ~every 8 tokens
   }
   int64_t total_us = esp_timer_get_time() - t_start;
 
@@ -222,7 +289,6 @@ void setup() {
                   s.profile.head_us / n);
   }
 #if USE_DISPLAY
-  // Closing card: compute-only tok/s (the model's own speed) + ms/token.
   display_stats(decoded * 1e6f / decode_us, decode_us / 1000.0f / decoded);
 #endif
   blink(0);

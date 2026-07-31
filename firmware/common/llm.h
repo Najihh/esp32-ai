@@ -16,6 +16,8 @@
 
 #define LLM_MAGIC 0x504C4531u
 #define RMS_EPS 1e-6f
+#define LLM_Q8_MAX_INPUT 4096
+
 
 typedef struct {
   int vocab, dim, n_layers, n_heads, ffn, ple_dim, seq_len, group;
@@ -28,6 +30,11 @@ typedef struct {
   const uint8_t  *codes;   // rows*row_bytes, nibble = value+8, row_bytes=ceil(cols/2)
   const uint16_t *scales;  // rows*n_groups fp16
   int rows, cols, group, n_groups, row_bytes;
+  /* Optional int8 staging: nibbles unpacked and group scales converted once, so
+   * each matvec skips both. Numerics are unchanged - same codes, same scales,
+   * same group sums. NULL selects the int4 path. */
+  const int8_t *w8;        // rows*cols, values -7..7
+  const float  *scale8;    // rows*n_groups, half2float'd once
 } QT;
 
 // IEEE half -> float.
@@ -64,7 +71,13 @@ typedef struct {
   QT ple_proj[32];        // [D, P]
   const float *ple_norm[32];  // [D]
   const float *out_norm;      // [D]
-  void (*head_matvec)(const QT *, const float *, float *); // optional platform override
+  size_t image_bytes;     // bytes consumed by the image, which is smaller than
+                          // the flash partition holding it
+
+  // Optional platform overrides; NULL uses MATVEC. Separate hooks because a
+  // tied 32,768-row head and a 66-row FFN matrix have different cost profiles.
+  void (*head_matvec)(const QT *, const float *, float *);
+  void (*layer_matvec)(const QT *, const float *, float *);
 } Model;
 
 // Advance a cursor over the file, binding one quant tensor. Reads the per-tensor
@@ -76,6 +89,7 @@ static const uint8_t *bind_q(const uint8_t *p, QT *t, int rows, int cols) {
   t->row_bytes = (cols + 1) / 2;
   t->codes = p;  p += (size_t)rows * t->row_bytes;
   t->scales = (const uint16_t *)p;  p += (size_t)rows * t->n_groups * 2;
+  t->w8 = NULL; t->scale8 = NULL;   // int4 path until staged
   return p;
 }
 static const uint8_t *bind_f(const uint8_t *p, const float **t, int n) {
@@ -150,15 +164,12 @@ static inline void matvec_q(const QT *t, const float *x, float *y) {
   matvec_q_range(t, x, y, 0, t->rows);
 }
 
-// ---- int8-activation path (the SIMD-friendly form) -------------------------
+// ---- int8-activation path ---------------------------------------------------
 // Quantize x to int8 once per call, then per output row do int8*int8 -> int32
-// group dot products, scaled by (x_scale * group_scale). The int32 group sum is
-// exactly what an S3 SIMD int8 dot instruction produces, so the device SIMD
-// kernel is numerically identical to this scalar reference -- only faster. The
-// ONLY approximation vs matvec_q is int8 activations, which the host golden
-// measures. Split into quantize + ranged-dot so the parallel head can quantize
-// once and let both cores read the shared int8 activations.
-static void quantize_act(const float *x, int n, int8_t *xq, float *x_scale) {
+// group dot products, scaled by (x_scale * group_scale). The only approximation
+// against matvec_q is the int8 activations. Split into quantize + ranged-dot so
+// a parallel caller can quantize once and let both cores read the result.
+static inline void quantize_act(const float *x, int n, int8_t *xq, float *x_scale) {
   float xmax = 1e-8f;
   for (int j = 0; j < n; j++) { float a = fabsf(x[j]); if (a > xmax) xmax = a; }
   float inv = 127.f / xmax;
@@ -169,7 +180,7 @@ static void quantize_act(const float *x, int n, int8_t *xq, float *x_scale) {
   *x_scale = xmax / 127.f;
 }
 
-static void matvec_q8_range(const QT *t, const int8_t *xq, float x_scale,
+static inline void matvec_q8_range(const QT *t, const int8_t *xq, float x_scale,
                             float *y, int row_begin, int row_end) {
   for (int r = row_begin; r < row_end; r++) {
     const uint8_t *row = t->codes + (size_t)r * t->row_bytes;
@@ -178,7 +189,7 @@ static void matvec_q8_range(const QT *t, const int8_t *xq, float x_scale,
     for (int gi = 0; gi < t->n_groups; gi++) {
       int begin = gi * t->group, end = begin + t->group;
       if (end > t->cols) end = t->cols;
-      int32_t g = 0;                       // <-- the SIMD int8 dot lives here
+      int32_t g = 0;                       // group accumulator
       for (int j = begin; j < end; j++) {
         uint8_t byte = row[j >> 1];
         int code = (j & 1) ? (byte >> 4) : (byte & 0xF);
@@ -190,10 +201,41 @@ static void matvec_q8_range(const QT *t, const int8_t *xq, float x_scale,
   }
 }
 
-static void matvec_q8(const QT *t, const float *x, float *y) {
-  static int8_t xq[1024];  // max input dim across the model is 128
+/* Scalar int8 dot product. */
+static inline int32_t llm_dot_i8(const int8_t *a, const int8_t *b, int n) {
+  int32_t acc = 0;
+  for (int i = 0; i < n; i++) acc += (int32_t)a[i] * (int32_t)b[i];
+  return acc;
+}
+
+/* Same arithmetic as matvec_q8_range, reading pre-unpacked int8 weights.
+ *
+ * Keep out of line on ESP32-S3: with Arduino ESP32 3.3.10 at -O3, inlining
+ * regressed inference from 95.0 to 155.2 ms/token. */
+#if defined(__GNUC__)
+__attribute__((noinline))
+#endif
+static void matvec_i8_range(const QT *t, const int8_t *xq, float x_scale,
+                            float *y, int row_begin, int row_end) {
+  int g = t->group, ng = t->n_groups, cols = t->cols;
+  for (int r = row_begin; r < row_end; r++) {
+    const int8_t *w = t->w8 + (size_t)r * cols;
+    const float *sc = t->scale8 + (size_t)r * ng;
+    float acc = 0.f;
+    for (int gi = 0; gi < ng; gi++) {
+      int begin = gi * g, end = begin + g;
+      if (end > cols) end = cols;
+      acc += (float)llm_dot_i8(w + begin, xq + begin, end - begin) * sc[gi];
+    }
+    y[r] = acc * x_scale;
+  }
+}
+
+static inline void matvec_q8(const QT *t, const float *x, float *y) {
+  static int8_t xq[LLM_Q8_MAX_INPUT];
   float xs;
   quantize_act(x, t->cols, xq, &xs);
+  if (t->w8 != NULL) { matvec_i8_range(t, xq, xs, y, 0, t->rows); return; }
   matvec_q8_range(t, xq, xs, y, 0, t->rows);
 }
 
@@ -223,6 +265,7 @@ static int llm_load(const uint8_t *base, Model *m) {
   m->c.ffn = hv[4]; m->c.ple_dim = hv[5]; m->c.seq_len = hv[6]; m->c.group = hv[7];
   memcpy(&m->c.rope_theta, p, 4); p += 4;
   m->head_matvec = NULL;
+  m->layer_matvec = NULL;
   int D = m->c.dim, L = m->c.n_layers, P = m->c.ple_dim, F = m->c.ffn, V = m->c.vocab;
 
   p = bind_q(p, &m->tok_emb, V, D);
@@ -242,7 +285,70 @@ static int llm_load(const uint8_t *base, Model *m) {
     p = bind_f(p, &m->ple_norm[i], D);
   }
   p = bind_f(p, &m->out_norm, D);
+  m->image_bytes = (size_t)(p - base);
   return 0;
+}
+
+/* ---- int8 staging -------------------------------------------------------
+ * Costs 2x the bytes of the int4 form. The caller supplies the buffer, so
+ * placement is the platform's choice. */
+/* Byte offset of the float scale array in a staged buffer. rows*cols need not
+ * be a multiple of 4, so the offset is rounded up to keep the float* aligned. */
+static inline size_t llm_stage_scale_offset(const QT *t) {
+  size_t w_bytes = (size_t)t->rows * t->cols * sizeof(int8_t);
+  return (w_bytes + sizeof(float) - 1) & ~(size_t)(sizeof(float) - 1);
+}
+
+static inline size_t llm_stage_int8_bytes(const QT *t) {
+  return llm_stage_scale_offset(t)
+       + (size_t)t->rows * t->n_groups * sizeof(float);
+}
+
+static inline void llm_stage_int8(QT *t, void *buffer) {
+  int8_t *w = (int8_t *)buffer;
+  float *sc = (float *)((uint8_t *)buffer + llm_stage_scale_offset(t));
+  for (int r = 0; r < t->rows; r++) {
+    const uint8_t *row = t->codes + (size_t)r * t->row_bytes;
+    int8_t *dst = w + (size_t)r * t->cols;
+    for (int j = 0; j < t->cols; j++) {
+      uint8_t byte = row[j >> 1];
+      int code = (j & 1) ? (byte >> 4) : (byte & 0xF);
+      dst[j] = (int8_t)(code - 8);
+    }
+    for (int gi = 0; gi < t->n_groups; gi++)
+      sc[(size_t)r * t->n_groups + gi] =
+          half2float(t->scales[(size_t)r * t->n_groups + gi]);
+  }
+  t->w8 = w;
+  t->scale8 = sc;
+}
+
+/* Stage every per-position tensor, one allocation per tensor: a multi-megabyte
+ * contiguous request fails on a fragmented heap even when total free is larger.
+ * Returns the number staged; a tensor whose allocation fails keeps the int4
+ * path. Callers requiring a guaranteed placement compare this against
+ * llm_core_stage_count(). */
+static inline int llm_stage_core_int8_alloc(Model *m, void *(*alloc)(size_t)) {
+  int staged = 0;
+  QT *tensors[7];
+  void *buf = alloc(llm_stage_int8_bytes(&m->ple_model_proj));
+  if (buf) { llm_stage_int8(&m->ple_model_proj, buf); ++staged; }
+  for (int l = 0; l < m->c.n_layers; l++) {
+    tensors[0] = &m->qkv[l];       tensors[1] = &m->attn_proj[l];
+    tensors[2] = &m->gate[l];      tensors[3] = &m->up[l];
+    tensors[4] = &m->down[l];      tensors[5] = &m->ple_gate[l];
+    tensors[6] = &m->ple_proj[l];
+    for (int i = 0; i < 7; i++) {
+      void *b = alloc(llm_stage_int8_bytes(tensors[i]));
+      if (b) { llm_stage_int8(tensors[i], b); ++staged; }
+    }
+  }
+  return staged;
+}
+
+/* Number of tensors llm_stage_core_int8_alloc attempts. */
+static inline int llm_core_stage_count(const Model *m) {
+  return 1 + 7 * m->c.n_layers;
 }
 
 // Scratch buffers, caller-allocated (host: malloc; device: PSRAM).
@@ -265,6 +371,11 @@ static void llm_profile_reset(Scratch *s) {
 #endif
 
 // One decode step: token at position pos -> logits[V]. KV cache persists across calls.
+/* Per-layer matvec dispatch: platform hook if set, otherwise MATVEC. */
+#define LLM_LMV(m, t, x, y) \
+  do { if ((m)->layer_matvec) (m)->layer_matvec((t), (x), (y)); \
+       else MATVEC((t), (x), (y)); } while (0)
+
 static void llm_forward(Model *m, int token, int pos, Scratch *s) {
   int D = m->c.dim, L = m->c.n_layers, P = m->c.ple_dim, F = m->c.ffn;
   int H = m->c.n_heads, Dh = D / H, S = m->c.seq_len;
@@ -275,7 +386,7 @@ static void llm_forward(Model *m, int token, int pos, Scratch *s) {
   deq_row(&m->tok_emb, token, s->x);           // embedding
 
   // ---- per-layer input: (RMSNorm(proj(x)/sqrt(D)) + table[tok]*sqrt(P)) / sqrt(2)
-  MATVEC(&m->ple_model_proj, s->x, s->tmpP); // [L*P]
+  LLM_LMV(m, &m->ple_model_proj, s->x, s->tmpP); // [L*P]
   float dscale = 1.f / sqrtf((float)D);
   for (int i = 0; i < L * P; i++) s->tmpP[i] *= dscale;
   for (int l = 0; l < L; l++)
@@ -302,7 +413,7 @@ static void llm_forward(Model *m, int token, int pos, Scratch *s) {
   for (int l = 0; l < L; l++) {
     // ---- attention
     rmsnorm(s->x, m->attn_norm[l], D, s->h);
-    MATVEC(&m->qkv[l], s->h, s->qkv);        // [3D]
+    LLM_LMV(m, &m->qkv[l], s->h, s->qkv);        // [3D]
     float *q = s->qkv, *k = s->qkv + D, *v = s->qkv + 2 * D;
     // split-half RoPE at position pos, per head
     for (int hh = 0; hh < H; hh++) {
@@ -341,7 +452,7 @@ static void llm_forward(Model *m, int token, int pos, Scratch *s) {
       }
       for (int i = 0; i < Dh; i++) ao[i] /= denom;
     }
-    MATVEC(&m->attn_proj[l], s->att, s->h);
+    LLM_LMV(m, &m->attn_proj[l], s->att, s->h);
     for (int i = 0; i < D; i++) s->x[i] += s->h[i];
 #ifdef LLM_PROFILE
     uint64_t profile_t2 = (uint64_t)LLM_PROFILE_NOW();
@@ -350,10 +461,10 @@ static void llm_forward(Model *m, int token, int pos, Scratch *s) {
 
     // ---- SwiGLU FFN
     rmsnorm(s->x, m->ffn_norm[l], D, s->h);
-    MATVEC(&m->gate[l], s->h, s->g1);
-    MATVEC(&m->up[l], s->h, s->g2);
+    LLM_LMV(m, &m->gate[l], s->h, s->g1);
+    LLM_LMV(m, &m->up[l], s->h, s->g2);
     for (int i = 0; i < F; i++) s->g1[i] = silu(s->g1[i]) * s->g2[i];
-    MATVEC(&m->down[l], s->g1, s->h);
+    LLM_LMV(m, &m->down[l], s->g1, s->h);
     for (int i = 0; i < D; i++) s->x[i] += s->h[i];
 #ifdef LLM_PROFILE
     uint64_t profile_t3 = (uint64_t)LLM_PROFILE_NOW();
@@ -361,9 +472,9 @@ static void llm_forward(Model *m, int token, int pos, Scratch *s) {
 #endif
 
     // ---- PLE gate: x += RMSNorm(ple_proj(gelu(ple_gate(x)) * ple_l))
-    MATVEC(&m->ple_gate[l], s->x, s->g2);    // [P]
+    LLM_LMV(m, &m->ple_gate[l], s->x, s->g2);    // [P]
     for (int i = 0; i < P; i++) s->g2[i] = gelu(s->g2[i]) * s->ple[l * P + i];
-    MATVEC(&m->ple_proj[l], s->g2, s->h);    // [D]
+    LLM_LMV(m, &m->ple_proj[l], s->g2, s->h);    // [D]
     rmsnorm(s->h, m->ple_norm[l], D, s->h);
     for (int i = 0; i < D; i++) s->x[i] += s->h[i];
 #ifdef LLM_PROFILE
