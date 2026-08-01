@@ -318,6 +318,29 @@ class TestEncodingContract(GeneratorCase):
                                     "end_of_word_suffix": "", "dropout": 0}))
 
 
+class TestRawAsset(GeneratorCase):
+    """--asset writes the same bytes the header embeds, so the host check and
+    the firmware cannot be looking at different tables."""
+
+    def test_raw_asset_matches_the_embedded_bytes(self):
+        path = self.write(tokenizer())
+        header = self.dir / "generated" / "tok.h"
+        raw = self.dir / "raw" / "tokenizer.btk"
+        with contextlib.redirect_stdout(io.StringIO()):
+            gen.generate(path, header, raw)
+        declared, embedded = parse(header.read_text())
+        self.assertTrue(raw.exists())            # its directory was created too
+        self.assertEqual(raw.read_bytes(), embedded)
+        self.assertEqual(len(raw.read_bytes()), declared)
+
+    def test_asset_is_not_written_unless_asked(self):
+        path = self.write(tokenizer())
+        header = self.dir / "generated" / "tok.h"
+        with contextlib.redirect_stdout(io.StringIO()):
+            gen.generate(path, header)
+        self.assertEqual(list(header.parent.iterdir()), [header])
+
+
 class TestMergeForms(GeneratorCase):
     def test_merges_may_be_pairs_instead_of_strings(self):
         # Newer tokenizer.json files store merges as two-element lists. The

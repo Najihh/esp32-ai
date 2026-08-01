@@ -299,8 +299,13 @@ def render(asset):
     return "\n".join(lines) + "\n"
 
 
-def generate(tokenizer_path, out_path):
-    """Validate the tokenizer and write the header. Returns the path."""
+def generate(tokenizer_path, out_path, asset_path=None):
+    """Validate the tokenizer and write the header. Returns the path.
+
+    asset_path additionally writes the raw BTK1 bytes, which is what the host
+    conformance check loads: it reads the asset from a file rather than being
+    recompiled against a header for every tokenizer.
+    """
     source = read_tokenizer(tokenizer_path)
     asset, active_vocab, merge_count, merge_base = build_asset(source)
 
@@ -311,6 +316,11 @@ def generate(tokenizer_path, out_path):
 
     print(f"wrote {out_path}: {len(asset)} B asset, vocab {active_vocab}, "
           f"{merge_count} merges, merge base {merge_base}")
+    if asset_path is not None:
+        asset_path = Path(asset_path)
+        asset_path.parent.mkdir(parents=True, exist_ok=True)
+        asset_path.write_bytes(asset)
+        print(f"wrote {asset_path}: {len(asset)} B raw BTK1")
     print(f"  tokenizer sha256 {hashlib.sha256(source).hexdigest()}")
     return out_path
 
@@ -321,8 +331,10 @@ def main():
     ap.add_argument("--tokenizer", default=DEFAULT_TOKENIZER,
                     help="canonical tokenizer.json the asset is built from")
     ap.add_argument("--out", default=DEFAULT_OUT, help="header to write")
+    ap.add_argument("--asset", default=None,
+                    help="also write the raw BTK1 bytes here, for host checks")
     args = ap.parse_args()
-    generate(args.tokenizer, args.out)
+    generate(args.tokenizer, args.out, args.asset)
 
 
 if __name__ == "__main__":
