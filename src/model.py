@@ -38,6 +38,12 @@ import torch.nn.functional as F
 class Config:
     arm: str = "baseline"
     vocab_size: int = 4096
+    # Rows in the output head. None, or a value equal to vocab_size, means the
+    # model writes the vocabulary it reads: the two are one id space and a
+    # sampled index is a token id. A different value gives the model its own
+    # output alphabet, so the head is a separate tensor and a sampled index is a
+    # class that has to be mapped before it can be fed back in.
+    out_vocab_size: int | None = None
     d_model: int = 128
     n_layers: int = 6
     n_heads: int = 4
@@ -53,6 +59,27 @@ class Config:
     @property
     def uses_per_layer(self):
         return self.arm in ("ple", "ple_notable")
+
+    @property
+    def resolved_out_vocab_size(self):
+        """Rows in the output head. Defaults to the read vocabulary."""
+        return self.vocab_size if self.out_vocab_size is None else self.out_vocab_size
+
+    @property
+    def output_ids_are_input_ids(self):
+        """Whether a sampled index can be fed straight back in as a token."""
+        return self.resolved_out_vocab_size == self.vocab_size
+
+    @property
+    def head_is_tied(self):
+        """Whether the head shares storage with tok_emb.
+
+        Two conditions, and they are not the same question: the alphabets must
+        match, and the tensors must have the same width. fatembed widens tok_emb
+        to table_width, so it always keeps a separate head even though it writes
+        what it reads.
+        """
+        return self.arm != "fatembed" and self.output_ids_are_input_ids
 
     @property
     def table_width(self):
@@ -151,14 +178,16 @@ class TinyLM(nn.Module):
         super().__init__()
         self.cfg = cfg
 
+        out_vocab = cfg.resolved_out_vocab_size
         if cfg.arm == "fatembed":
             self.tok_emb = nn.Embedding(cfg.vocab_size, cfg.table_width)
             self.emb_down = nn.Linear(cfg.table_width, cfg.d_model, bias=False)
-            self.head = nn.Linear(cfg.d_model, cfg.vocab_size, bias=False)
+            self.head = nn.Linear(cfg.d_model, out_vocab, bias=False)
         else:
             self.tok_emb = nn.Embedding(cfg.vocab_size, cfg.d_model)
-            self.head = nn.Linear(cfg.d_model, cfg.vocab_size, bias=False)
-            self.head.weight = self.tok_emb.weight  # tied
+            self.head = nn.Linear(cfg.d_model, out_vocab, bias=False)
+            if cfg.head_is_tied:
+                self.head.weight = self.tok_emb.weight  # tied
 
         if cfg.uses_per_layer:
             # Context-aware half of the per-layer input: one projection of the
@@ -223,8 +252,12 @@ class TinyLM(nn.Module):
         logits = self.head(x)
         loss = None
         if targets is not None:
+            # Reshape by the head's own width, not the read vocabulary. The
+            # two differ whenever the output width differs from vocab_size.
             loss = F.cross_entropy(
-                logits.view(-1, cfg.vocab_size), targets.reshape(-1), ignore_index=-1
+                logits.reshape(-1, cfg.resolved_out_vocab_size),
+                targets.reshape(-1),
+                ignore_index=-1,
             )
         return logits, loss
 
@@ -244,7 +277,9 @@ class TinyLM(nn.Module):
         table = 0
         if self.cfg.arm == "ple":
             table += self.ple_table.weight.numel()
-        if self.cfg.arm == "fatembed":
+        if not self.cfg.head_is_tied:
+            # A tied embedding is already accounted for through head.weight;
+            # otherwise it is sparse table data, read one row per token.
             table += self.tok_emb.weight.numel()
         stream = self.head.weight.numel()
         seen, total = set(), 0
@@ -258,6 +293,17 @@ class TinyLM(nn.Module):
 
     @torch.no_grad()
     def generate(self, idx, max_new_tokens, temperature=0.8, top_k=40):
+        # Appending a sample to idx requires that a sampled index IS a token
+        # id. Under a distinct output alphabet it is a class, and the class to
+        # token map is model data rather than architecture, so the caller owns
+        # both the map and the sampling loop.
+        if not self.cfg.output_ids_are_input_ids:
+            raise ValueError(
+                f"generate() needs the head to span the input vocabulary, but "
+                f"this model writes {self.cfg.resolved_out_vocab_size} classes "
+                f"and reads {self.cfg.vocab_size} tokens; sample with the "
+                f"output-class to input-token map instead"
+            )
         for _ in range(max_new_tokens):
             idx_c = idx[:, -self.cfg.seq_len :]
             logits, _ = self(idx_c)
