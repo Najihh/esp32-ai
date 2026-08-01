@@ -1,5 +1,5 @@
 // Host-side correctness check: run the portable C inference on the golden prompt
-// and compare its last-position logits to PyTorch's (dumped by src/export.py).
+// and compare its last-position logits to PyTorch's (dumped by the exporter).
 // If these match to fp tolerance, the C port is correct and can go to the ESP32.
 #include <stdio.h>
 #include <stdlib.h>

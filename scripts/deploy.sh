@@ -53,8 +53,8 @@ PORT=${PORT:-$(ls /dev/cu.usbmodem* 2>/dev/null | head -1 || true)}
 
 test -f "$MODEL" || {
   echo "$MODEL missing." >&2
-  echo "Fetch the released model into $ARTIFACTS/, or export one with:" >&2
-  echo "  uv run python src/export.py <checkpoint-tag>" >&2
+  echo "Place the model artifacts in $ARTIFACTS/, or generate them with:" >&2
+  echo "  uv run python -m research.tinystories.export <checkpoint-tag>" >&2
   exit 1; }
 test -f "$TOKENIZER" || {
   echo "$TOKENIZER missing. The decode table is built from it, so it must ship" >&2
@@ -71,9 +71,9 @@ uv run python "$SKETCH/tools/generate_vocab.py" \
 
 CFLAGS='-O3 -Wall -Wextra'
 
-# The golden is produced by src/export.py and is not part of a released model,
-# so a clone that only fetched model.bin will not have one. Skip visibly rather
-# than fail: staging_verify below needs no golden and still runs.
+# The golden is produced by the exporter, which this script does not invoke, so
+# it may simply be absent. Skip visibly rather than fail: staging_verify below
+# needs no golden and still runs.
 if [ -f "$GOLDEN" ]; then
   echo "=== host verify: exact int4 path vs PyTorch golden ==="
   cc $CFLAGS -o /tmp/llm_verify runtime/host_verify/verify.c -lm

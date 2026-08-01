@@ -44,7 +44,7 @@ uv run python firmware/esp32_tinystories/tools/generate_vocab.py \
 To regenerate the model artifacts from a checkpoint:
 
 ```bash
-uv run python src/export.py <checkpoint-tag>
+uv run python -m research.tinystories.export <checkpoint-tag>
 ```
 
 Build the device firmware with Arduino ESP32 core 3.3.10:

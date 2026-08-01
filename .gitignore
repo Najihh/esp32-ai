@@ -12,7 +12,8 @@ data/*.json
 # training outputs
 runs/
 
-# model artifacts: fetched from the model registry or written by src/export.py
+# model artifacts: fetched from the model registry, or written by the
+# reproduction exporter
 /artifacts/
 
 # headers each sketch generates from those artifacts

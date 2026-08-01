@@ -12,17 +12,19 @@ Format is deliberately dead-simple (the C reader is ~30 lines):
   then, in a fixed order the C code hard-codes, each tensor as either
     QUANT: int4 codes packed 2-per-byte (group-wise, group=G along last dim)
            followed by fp16 scales, one per group
-    FP32 : raw fp32 (norms only -- tiny)
+    FP32 : raw fp32 (norms only - tiny)
 
-Quantization matches src/quantize.py exactly (symmetric group-wise int4), so the
+quant_pack below reimplements the symmetric group-wise int4 of src/quantize.py
+because it also needs the packed byte layout, so the
 golden logits are the *4-bit* model's logits: C-vs-PyTorch then isolates port
 correctness from quantization error, which was measured separately.
 """
 
+import argparse
+import hashlib
 import os
 import shutil
 import struct
-import sys
 
 import numpy as np
 import torch
@@ -30,12 +32,13 @@ import torch
 from tokenizers import Tokenizer
 
 from model import Config, TinyLM
-from quantize import quantize_groupwise
 
-HERE = os.path.dirname(os.path.abspath(__file__))
-RUNS = os.path.join(HERE, "..", "runs")
-OUT = os.path.join(HERE, "..", "artifacts", "tinystories")
-TOK = os.path.join(HERE, "..", "data", "bpe32768.json")
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[2]
+RUNS = str(ROOT / "runs")
+OUT = str(ROOT / "artifacts" / "tinystories")
+TOK = str(ROOT / "data" / "bpe32768.json")
 MAGIC = 0x00454C50  # "PLE\0"
 FORMAT_VERSION = 1
 HEADER_BYTES = 56
@@ -82,11 +85,53 @@ def quant_pack(w, group=GROUP):
     return packed.reshape(-1), scales16.reshape(-1), dq
 
 
+def verify_tokenizer(ck, tokenizer_path, allow_unverified):
+    """Refuse a tokenizer that did not train this checkpoint.
+
+    The size check alone is not enough: a smaller wrong tokenizer passes it and
+    silently produces a model with the wrong output vocabulary.
+
+    Checkpoints written before the hash was recorded cannot be checked. This
+    produces a binary intended for distribution, so an unverifiable tokenizer is
+    an error by default; --allow-unverified-tokenizer makes that exception
+    explicit and visible in the command that made the artifact.
+    """
+    want = ck.get("tokenizer_sha256")
+    got = hashlib.sha256(open(tokenizer_path, "rb").read()).hexdigest()
+    if want is None:
+        if not allow_unverified:
+            raise SystemExit(
+                f"checkpoint records no tokenizer hash, so {os.path.basename(tokenizer_path)} "
+                f"cannot be verified as the one it was trained with. Re-train to "
+                f"record it, or pass --allow-unverified-tokenizer to accept the risk.")
+        print(f"WARNING: tokenizer unverified ({os.path.basename(tokenizer_path)}); "
+              f"checkpoint predates tokenizer hashing")
+        return
+    if want != got:
+        raise SystemExit(
+            f"tokenizer mismatch: {tokenizer_path} is sha256 {got[:16]}... but "
+            f"this checkpoint was trained with {want[:16]}...")
+
+
 def main():
-    tag = sys.argv[1] if len(sys.argv) > 1 else "ple-cleandeploy-s0"
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("tag", nargs="?", default="ple-cleandeploy-s0",
+                    help="checkpoint tag under runs/, without .pt")
+    ap.add_argument("--tokenizer", default=TOK,
+                    help="tokenizer this checkpoint was trained with; its size "
+                         "becomes output_vocab")
+    ap.add_argument("--allow-unverified-tokenizer", action="store_true",
+                    help="export from a checkpoint that records no tokenizer hash")
+    args = ap.parse_args()
+    tag = args.tag
     os.makedirs(OUT, exist_ok=True)
     ck = torch.load(os.path.join(RUNS, f"{tag}.pt"), map_location="cpu", weights_only=False)
     cfg = Config(**ck["cfg"])
+    # This exporter writes the tied-head PLE layout. Another arm has a
+    # different tensor set, and the plan below would bind garbage.
+    if cfg.arm != "ple":
+        raise SystemExit(f"{tag} is arm={cfg.arm}; this exporter writes PLE models")
+    verify_tokenizer(ck, args.tokenizer, args.allow_unverified_tokenizer)
     model = TinyLM(cfg)
     model.load_state_dict(ck["state"])
     model.eval()
@@ -131,8 +176,18 @@ def main():
     # tokenizer's entries can ever be produced or decoded. output_vocab is that
     # count, so the header describes what the runtime actually scores instead of
     # leaving the firmware to cap it from a generated header.
-    out_vocab = Tokenizer.from_file(TOK).get_vocab_size()
-    print(f"input_vocab={cfg.vocab_size}  output_vocab={out_vocab} (from tokenizer)")
+    out_vocab = Tokenizer.from_file(args.tokenizer).get_vocab_size()
+    # The header tells the runtime how many logits to score, and the tied head is
+    # the first out_vocab rows of the embedding. A tokenizer larger than the
+    # checkpoint's embedding would make the runtime read past that tensor, so
+    # this is a hard error rather than a warning: it cannot be caught later.
+    if not 0 < out_vocab <= cfg.vocab_size:
+        raise SystemExit(
+            f"tokenizer/checkpoint mismatch: {args.tokenizer} has {out_vocab} "
+            f"entries but the checkpoint embedding has {cfg.vocab_size} rows. "
+            f"Pass --tokenizer for the one this run was trained with.")
+    print(f"input_vocab={cfg.vocab_size}  output_vocab={out_vocab} "
+          f"(from {os.path.basename(args.tokenizer)})")
 
     # Write binary. artifacts/ is gitignored, so it does not exist in a fresh
     # clone.
@@ -162,7 +217,7 @@ def main():
     # Copy the tokenizer beside the weights so the artifact directory is a
     # complete, self-contained model: everything the firmware build and the
     # device need, and nothing that has to be looked up elsewhere.
-    shutil.copyfile(TOK, os.path.join(OUT, "tokenizer.json"))
+    shutil.copyfile(args.tokenizer, os.path.join(OUT, "tokenizer.json"))
 
     # Keep the tied output head == dequantized input embedding. state_dict lists
     # both keys for tied weights; without this the head silently stays fp32 and
