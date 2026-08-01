@@ -65,8 +65,9 @@ parameter model can say.
 ## Running it yourself
 
 The firmware, the wiring, and the flashing steps live in
-[`firmware/esp32_tinystories/README.md`](firmware/esp32_tinystories/README.md). The training,
-ablation, and quantization code is in `src/` and `experiments/`. The full method,
+[`firmware/esp32_tinystories/README.md`](firmware/esp32_tinystories/README.md). The reusable
+architecture is in `src/`; the training, ablation and quantization code that
+reproduces the published numbers is in `research/tinystories/`. The full method,
 the ablations, and the on-chip measurements are written up in
 [`RESULTS.md`](RESULTS.md).
 

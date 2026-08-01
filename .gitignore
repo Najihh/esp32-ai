@@ -4,7 +4,7 @@ __pycache__/
 *.pyc
 *.egg-info/
 
-# data + tokenizers (regenerate with data/prepare.py)
+# data + tokenizers (regenerate with research/tinystories/prepare.py)
 data/*.bin
 data/*.txt
 data/*.json

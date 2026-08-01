@@ -1,6 +1,7 @@
 """Train one ablation arm and report val loss at matched core-parameter budget."""
 
 import argparse
+import hashlib
 import json
 import math
 import os
@@ -11,9 +12,13 @@ import torch
 
 from model import Config, TinyLM, make_model
 
-HERE = os.path.dirname(os.path.abspath(__file__))
-DATA = os.path.join(HERE, "..", "data")
-RUNS = os.path.join(HERE, "..", "runs")
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[2]
+# Dataset and checkpoints stay at the repository root, shared by every
+# reproduction script here.
+DATA = str(ROOT / "data")
+RUNS = str(ROOT / "runs")
 
 
 def get_device():
@@ -25,10 +30,17 @@ def get_device():
 
 
 class Batcher:
-    def __init__(self, split, batch_size, seq_len, device, suffix=""):
+    def __init__(self, split, batch_size, seq_len, device, suffix="", seed=0):
+        # The bins are uint16. Reading a wider vocabulary through that dtype
+        # yields plausible token ids rather than an error, so check before
+        # opening.
         self.data = np.memmap(os.path.join(DATA, f"{split}{suffix}.bin"), dtype=np.uint16, mode="r")
         self.bs, self.sl, self.device = batch_size, seq_len, device
-        self.rng = np.random.default_rng(1234 if split == "val" else None)
+        # Batch order is part of the run. Without the seed here, torch.manual_seed
+        # fixes initialisation only and two runs at the same --seed still see
+        # different data order. Validation keeps a fixed stream so every arm is
+        # scored on identical batches.
+        self.rng = np.random.default_rng(1234 if split == "val" else seed)
 
     def __call__(self):
         ix = self.rng.integers(0, len(self.data) - self.sl - 1, self.bs)
@@ -79,6 +91,22 @@ def main():
     ap.add_argument("--tag", default="")
     args = ap.parse_args()
 
+    # Before anything expensive: the tokenizer that produced these bins. Its
+    # hash is what lets the exporter and sampler refuse a mismatched tokenizer
+    # later, and a checkpoint written without it cannot be tied to one. Failing
+    # here costs nothing; failing after a 30-minute run costs the run.
+    if not 0 < args.vocab <= 65536:
+        raise SystemExit(f"--vocab must be 1..65536; the token bins are uint16 "
+                         f"and are memmapped as uint16")
+
+    tok_path = os.path.join(DATA, f"bpe{args.vocab}.json")
+    if not os.path.exists(tok_path):
+        raise SystemExit(
+            f"{tok_path} missing. The bins this run trains on came from it, and "
+            f"without its hash the checkpoint cannot be tied to a tokenizer. "
+            f"Run: python -m research.tinystories.prepare --vocab {args.vocab}")
+    tok_sha = hashlib.sha256(open(tok_path, "rb").read()).hexdigest()
+
     torch.manual_seed(args.seed)
     device = get_device()
     os.makedirs(RUNS, exist_ok=True)
@@ -102,7 +130,8 @@ def main():
         betas=(0.9, 0.95),
     )
 
-    train_b = Batcher("train", args.batch_size, args.seq_len, device, suffix)
+    train_b = Batcher("train", args.batch_size, args.seq_len, device, suffix,
+                      seed=args.seed)
     val_b = Batcher("val", args.batch_size, args.seq_len, device, suffix)
 
     name = f"{args.arm}{'-' + args.tag if args.tag else ''}-s{args.seed}"
@@ -136,6 +165,18 @@ def main():
         "seed": args.seed,
         "tag": args.tag,
         "config": {k: v for k, v in cfg.__dict__.items()},
+        "training": {
+            "batch_size": args.batch_size,
+            "steps": args.steps,
+            "lr": args.lr,
+            "warmup": args.warmup,
+            "eval_every": args.eval_every,
+            "eval_iters": args.eval_iters,
+            "target_core": args.target_core,
+            "fixed_ffn": args.fixed_ffn,
+            "seed": args.seed,
+        },
+        "tokenizer_sha256": tok_sha,
         "params": budget,
         "final_val": history[-1]["val"],
         "best_val": best,
@@ -147,7 +188,13 @@ def main():
     }
     with open(os.path.join(RUNS, f"{name}.json"), "w") as f:
         json.dump(result, f, indent=2)
-    torch.save({"cfg": cfg.__dict__, "state": model.state_dict()},
+    # Identity and schedule live only in the filename and the sidecar JSON
+    # otherwise, so a checkpoint copied over another name, or trained on a
+    # different schedule, would pass every content check.
+    torch.save({"cfg": cfg.__dict__, "state": model.state_dict(),
+                "tokenizer_sha256": tok_sha,
+                "seed": args.seed, "tag": args.tag, "name": name,
+                "training": result["training"]},
                os.path.join(RUNS, f"{name}.pt"))
     print(f"{name} DONE core={budget['core']:,} table={budget['table']:,} "
           f"val={result['final_val']:.4f} ppl={result['final_ppl']:.2f}")
