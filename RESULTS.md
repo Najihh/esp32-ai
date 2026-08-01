@@ -224,7 +224,7 @@ more scalar cleanup and not a question about PLE table bandwidth.
 ## 4-bit quantization: the gain survives (2026-07-21)
 
 Group-wise symmetric int4 PTQ (group 64), the GGUF-Q4-style format you would flash
-(`src/quantize.py`). Every large weight quantized, including the 25M table. Two
+(`research/tinystories/quantize_eval.py`). Every large weight quantized, including the 25M table. Two
 seeds, vocab 32768 deploy models.
 
 | arm | fp32 -> 4-bit degradation | 
