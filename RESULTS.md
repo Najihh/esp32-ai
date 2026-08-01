@@ -1,7 +1,7 @@
 # Results
 
 All numbers below are under one consistent three-tier accounting (head excluded
-from core — see `src/budget.py`). Earlier mixed-accounting runs are archived in
+from core — see `param_budget()` in `src/model.py`). Earlier mixed-accounting runs are archived in
 `runs/_archive_old_accounting/` and should not be cited.
 
 **Status (2026-07-21): validated end to end.** PLE beats baseline (2 seeds), the

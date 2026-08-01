@@ -1,8 +1,11 @@
 """Tiny decoder-only transformer with pluggable embedding strategies.
 
 The experiment this file exists to run: on an ESP32-S3, weights touched on every
-token must live in ~512KB of internal SRAM, while flash is huge but only good for
-sparse random reads. That is the same memory-tier shape Gemma's Per-Layer
+token are the expensive ones - they must be reachable from fast memory, of which
+there is very little - while flash is huge but only good for sparse random reads.
+(The shipped runtime stages that dense core as int8 in PSRAM rather than SRAM;
+what matters to this experiment is the split between every-token and per-token
+weights, not which fast tier the former ends up in.) That is the same memory-tier shape Gemma's Per-Layer
 Embeddings were designed for, three orders of magnitude down. So we hold the
 *core* (dense, every-token) parameter count fixed and vary how extra
 *table* (sparse, per-token-lookup) parameters are spent.
@@ -227,13 +230,15 @@ class TinyLM(nn.Module):
 
     # ---- parameter accounting -------------------------------------------------
     # Three tiers matching the ESP32's three, by ACCESS PATTERN not just speed:
-    #   core   -- dense, random, every token   -> SRAM-resident (the scarce budget)
-    #   stream -- the output head: dense but read as one sequential scan per token
-    #             -> costs bandwidth, not SRAM; can live off-chip
-    #   table  -- sparse, one row per token     -> memory-mapped flash
+    #   core     dense, random, every token   -> the scarce budget. The
+    #            shipped runtime stages it as int8 in PSRAM, not SRAM. What
+    #            SRAM holds is the hot working set: activations and norms.
+    #   stream   the output head: dense but read as one sequential scan per
+    #            token -> costs bandwidth, not SRAM; can live off-chip
+    #   table    sparse, one row per token     -> memory-mapped flash
     # `core` deliberately EXCLUDES the head. Lumping the head in makes a large
     # vocabulary look unaffordable when it is merely slow, and blocks the whole
-    # cheap-table-via-big-vocab design from being built at all. See src/budget.py.
+    # cheap-table-via-big-vocab design from being built at all. See param_budget() below.
 
     def param_budget(self):
         table = 0
