@@ -169,6 +169,42 @@ static void test_untied(void) {
   free(img);
 }
 
+// FP32 tensors follow byte-packed quantized ones in the image, so a norm vector
+// can begin at any byte. rmsnorm takes a memcpy path when that happens; both
+// paths must agree exactly, and a model whose tensors all land aligned would
+// never reach the second one.
+//
+// The equality check alone does not prove the memcpy path is present: hosts
+// that tolerate unaligned loads return the same floats either way. What this
+// gives is a deterministic unaligned read on every run, so a sanitized build
+// reports it whichever model is passed. Run under UBSan to detect a regression.
+static void test_unaligned_norm(void) {
+  enum { N = 64 };
+  printf("\nunaligned norm weights (synthetic)\n");
+
+  float x[N], w[N], aligned_out[N], unaligned_out[N];
+  for (int i = 0; i < N; i++) {
+    x[i] = (float)(i % 7) - 3.f;
+    w[i] = 0.5f + (float)i * 0.01f;
+  }
+
+  // Aligned base plus 2, so the address is deterministically 2 mod 4 rather
+  // than whatever the array happened to land on.
+  _Alignas(float) uint8_t storage[N * sizeof(float) + 2];
+  memcpy(storage + 2, w, sizeof w);
+  const float *unaligned = (const float *)(void *)(storage + 2);
+
+  check("test vector is really unaligned",
+        ((uintptr_t)unaligned & (sizeof(float) - 1)) != 0, "");
+  check("reference vector is aligned",
+        ((uintptr_t)w & (sizeof(float) - 1)) == 0, "");
+
+  rmsnorm(x, w, N, aligned_out);
+  rmsnorm(x, unaligned, N, unaligned_out);
+  check("unaligned weights give bit-identical output",
+        memcmp(aligned_out, unaligned_out, sizeof aligned_out) == 0, "");
+}
+
 int main(int argc, char **argv) {
   if (argc < 2) {
     fprintf(stderr, "usage: %s <model.bin>\n", argv[0]);
@@ -284,6 +320,7 @@ int main(int argc, char **argv) {
         max_abs_diff(logits_nohook, s.logits, V) == 0.0, "");
 
   test_untied();
+  test_unaligned_norm();
 
   printf("\n%s (%d failure%s)\n", failures ? "FAIL" : "PASS",
          failures, failures == 1 ? "" : "s");

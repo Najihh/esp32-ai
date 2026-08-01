@@ -254,11 +254,23 @@ static inline void matvec_q8(const QT *t, const float *x, float *y) {
 #define MATVEC matvec_q
 #endif
 
+// w is bound straight into the model image, where fp32 tensors follow
+// byte-packed quantized ones and so need not be 4-byte aligned. x and out are
+// caller scratch and always are.
 static inline void rmsnorm(const float *x, const float *w, int n, float *out) {
   float ss = 0.f;
   for (int i = 0; i < n; i++) ss += x[i] * x[i];
   float inv = 1.f / sqrtf(ss / n + RMS_EPS);
-  for (int i = 0; i < n; i++) out[i] = w[i] * x[i] * inv;
+  if (((uintptr_t)w & (sizeof(float) - 1)) == 0) {
+    for (int i = 0; i < n; i++) out[i] = w[i] * x[i] * inv;
+    return;
+  }
+  const uint8_t *wb = (const uint8_t *)w;
+  for (int i = 0; i < n; i++) {
+    float wi;
+    memcpy(&wi, wb + (size_t)i * sizeof(float), sizeof wi);
+    out[i] = wi * x[i] * inv;
+  }
 }
 static inline float gelu(float x) { return 0.5f * x * (1.f + erff(x * 0.70710678f)); }
 static inline float silu(float x) { return x / (1.f + expf(-x)); }
