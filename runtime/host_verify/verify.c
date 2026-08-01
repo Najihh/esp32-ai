@@ -65,9 +65,11 @@ int main(int argc, char **argv) {
     if (ref[i] > ref[r_top]) r_top = i;
   }
   printf("sample logits (idx: C vs ref):\n");
+  // Fixed diagnostic indices outside [0,V) are skipped.
   int probe[8] = {265, 14, 1, 12, 13, 100, 5000, 20000};
   for (int i = 0; i < 8; i++)
-    printf("  [%5d]  C=%8.4f  ref=%8.4f\n", probe[i], s.logits[probe[i]], ref[probe[i]]);
+    if (probe[i] < V)
+      printf("  [%5d]  C=%8.4f  ref=%8.4f\n", probe[i], s.logits[probe[i]], ref[probe[i]]);
   printf("logits: C top=%d  PyTorch top=%d\n", c_top, r_top);
   printf("max abs diff = %.5f   rms diff = %.6f\n", maxabs, sqrt(sum2 / V));
   printf(maxabs < 0.02 ? "PASS: C matches PyTorch golden\n"
