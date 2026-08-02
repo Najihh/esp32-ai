@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# Flash the TinyStories model + firmware to an ESP32-S3.
+# Flash a model and its firmware to an ESP32-S3.
 #
-# The board holds ONE model at a time: the 14.9MB image claims the whole `model`
-# partition. There is no repartitioning trick.
+# The board has one model partition. Deploying either model replaces whichever
+# one is currently installed; there is no repartitioning trick.
 # pipefail: every step is piped through tail/grep/tr, and `set -e` alone does
 # not see a failure on the left of a pipe.
 set -euo pipefail
@@ -10,14 +10,111 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
-# TinyStories artifact paths. artifacts/ holds downloaded or exported model
-# files and is ignored; generated/ holds headers built from them.
-SKETCH=firmware/esp32_tinystories
-ARTIFACTS=${ARTIFACTS:-artifacts/tinystories}
-MODEL=${MODEL:-$ARTIFACTS/model.bin}
-TOKENIZER=${TOKENIZER:-$ARTIFACTS/tokenizer.json}
-GOLDEN=${GOLDEN:-$ARTIFACTS/golden.txt}
-VOCAB_H=$SKETCH/generated/vocab.h
+usage() {
+  cat >&2 <<'EOF'
+usage: scripts/deploy.sh <tinystories|barista>
+
+The model is mandatory: the board holds one at a time, and deploying replaces
+whatever is already there, so which one is being written is never implied.
+
+Generates that model's device headers, runs the applicable host gates including
+the golden gate when present, compiles, and only then writes the model partition
+and the firmware.
+
+Artifact paths may be overridden: ARTIFACTS, MODEL, TOKENIZER, GOLDEN, and for
+barista also VOCAB and LAYOUT.
+EOF
+  exit 2
+}
+
+# Argument first, before any tool lookup, build, or device access.
+[ $# -eq 1 ] || usage
+MODEL_KIND=$1
+
+# --- model-specific configuration -------------------------------------------
+# MODEL_KIND selects; MODEL stays the path to the binary being flashed.
+case "$MODEL_KIND" in
+  tinystories)
+    SKETCH=firmware/esp32_tinystories
+    ARTIFACTS=${ARTIFACTS:-artifacts/tinystories}
+    MODEL=${MODEL:-$ARTIFACTS/model.bin}
+    TOKENIZER=${TOKENIZER:-$ARTIFACTS/tokenizer.json}
+    GOLDEN=${GOLDEN:-$ARTIFACTS/golden.txt}
+    REQUIRED=("$MODEL" "$TOKENIZER")
+    # That exporter has no output-path option: it always writes
+    # artifacts/tinystories/, so a custom path here needs a copy afterwards.
+    EXPORT_HINT="  uv run python -m research.tinystories.export <checkpoint-tag>
+  It always writes to artifacts/tinystories/. If a different path is selected
+  here, copy the files across afterwards."
+    ;;
+  barista)
+    SKETCH=firmware/esp32_barista
+    ARTIFACTS=${ARTIFACTS:-artifacts/barista}
+    MODEL=${MODEL:-$ARTIFACTS/model.bin}
+    TOKENIZER=${TOKENIZER:-$ARTIFACTS/tokenizer.json}
+    GOLDEN=${GOLDEN:-$ARTIFACTS/golden.txt}
+    VOCAB=${VOCAB:-$ARTIFACTS/vocab.json}
+    LAYOUT=${LAYOUT:-$ARTIFACTS/layout.json}
+    REQUIRED=("$MODEL" "$TOKENIZER" "$VOCAB" "$LAYOUT")
+    # export.py writes model.bin, the goldens and metadata. It reads the other
+    # three, which are frozen with the trained model and cannot be regenerated
+    # here, so they have to be in place first.
+    EXPORT_HINT="  tokenizer.json, vocab.json and layout.json are frozen assets:
+  place them at the paths above first. Then produce model.bin, the goldens and
+  metadata with:
+    uv run python $SKETCH/tools/export.py --checkpoint <path> \\
+      --vocab \"$VOCAB\" \\
+      --layout \"$LAYOUT\" \\
+      --out-dir \"$ARTIFACTS\""
+    ;;
+  *)
+    usage
+    ;;
+esac
+
+# Every generator and checker is given the selected paths explicitly. Deriving
+# them again from defaults would let an ARTIFACTS override build headers from one
+# directory while conformance silently checked another.
+prepare_headers() {
+  case "$MODEL_KIND" in
+    tinystories)
+      # Rebuild the decode header from the tokenizer being deployed, every time.
+      # The firmware only checks that VOCAB_N equals the model's output_vocab, so
+      # a stale header from a different tokenizer with the same entry count would
+      # pass that check and decode every token wrongly.
+      echo "=== generate $SKETCH/generated/vocab.h from $TOKENIZER ==="
+      uv run python "$SKETCH/tools/generate_vocab.py" \
+        --tokenizer "$TOKENIZER" --out "$SKETCH/generated/vocab.h" 2>&1 | grep wrote
+      ;;
+    barista)
+      echo "=== generate word tables from $VOCAB and $LAYOUT ==="
+      uv run python "$SKETCH/tools/generate_vocab_headers.py" \
+        --vocab "$VOCAB" --layout "$LAYOUT" \
+        --out-dir "$SKETCH/generated" 2>&1 | grep wrote
+      echo "=== generate encoder asset from $TOKENIZER ==="
+      uv run python "$SKETCH/tools/generate_tokenizer_header.py" \
+        --tokenizer "$TOKENIZER" \
+        --out "$SKETCH/generated/tokenizer_encoder.h" 2>&1 | grep wrote
+      ;;
+  esac
+}
+
+extra_gates() {
+  case "$MODEL_KIND" in
+    tinystories)
+      : # The device only decodes: there is no on-device encoder to check.
+      ;;
+    barista)
+      # The device encodes questions, so its ids must equal the tokenizer's, and
+      # the reused word mappings must resolve to the ids they claim.
+      echo "=== host verify: device encoder vs Hugging Face, and the word map ==="
+      uv run python "$SKETCH/tools/verify_tokenizer.py" \
+        --tokenizer "$TOKENIZER" --vocab "$VOCAB" --layout "$LAYOUT" 2>&1 | tail -1
+      ;;
+  esac
+}
+
+# --- everything below is shared ---------------------------------------------
 PART_OFFSET=0x110000
 
 FQBN='esp32:esp32:esp32s3:UploadSpeed=921600,USBMode=hwcdc,CDCOnBoot=cdc,UploadMode=default,CPUFreq=240,FlashMode=qio,FlashSize=16M,PartitionScheme=custom,PSRAM=opi,DebugLevel=info'
@@ -51,23 +148,19 @@ ESPTOOL=$(find_esptool)
 PORT=${PORT:-$(ls /dev/cu.usbmodem* 2>/dev/null | head -1 || true)}
 [ -n "$PORT" ] || { echo "no /dev/cu.usbmodem* found; plug the board in, or set PORT=..." >&2; exit 1; }
 
-test -f "$MODEL" || {
-  echo "$MODEL missing." >&2
-  echo "Place the model artifacts in $ARTIFACTS/, or generate them with:" >&2
-  echo "  uv run python -m research.tinystories.export <checkpoint-tag>" >&2
-  exit 1; }
-test -f "$TOKENIZER" || {
-  echo "$TOKENIZER missing. The decode table is built from it, so it must ship" >&2
-  echo "with the model." >&2
-  exit 1; }
+# Every required artifact is checked before anything is generated or built, so a
+# missing file is reported as a list rather than discovered halfway through.
+missing=0
+for f in "${REQUIRED[@]}"; do
+  [ -f "$f" ] || { echo "missing artifact: $f" >&2; missing=1; }
+done
+if [ "$missing" -ne 0 ]; then
+  echo "required artifacts are missing; the expected paths are listed above" >&2
+  echo "$EXPORT_HINT" >&2
+  exit 1
+fi
 
-# Rebuild the decode header from the tokenizer being deployed, every time. The
-# firmware only checks that VOCAB_N equals the model's output_vocab, so a stale
-# header from a different tokenizer with the same entry count would pass that
-# check and decode every token wrongly.
-echo "=== generate $VOCAB_H from $TOKENIZER ==="
-uv run python "$SKETCH/tools/generate_vocab.py" \
-  --tokenizer "$TOKENIZER" --out "$VOCAB_H" 2>&1 | grep wrote
+prepare_headers
 
 CFLAGS='-O3 -Wall -Wextra'
 
@@ -89,6 +182,8 @@ echo "=== host verify: int8 staging + platform hooks ==="
 cc $CFLAGS -DLLM_INT8_ACT=1 -o /tmp/llm_staging runtime/host_verify/staging_verify.c -lm
 /tmp/llm_staging "$MODEL" 2>&1 | tail -3
 
+extra_gates
+
 # Compile and verify before writing either image: a build failure after the
 # model flash would leave new weights under old firmware.
 BUILD_DIR="${TMPDIR:-/tmp}/esp32ai-build-$(basename "$SKETCH")"
@@ -98,15 +193,8 @@ arduino-cli compile --fqbn "$FQBN" \
   --build-path "$BUILD_DIR" \
   "$SKETCH" 2>&1 | tail -2
 
-echo "=== flash model ($(du -h "$MODEL" | cut -f1)) -> $PORT @ $PART_OFFSET ==="
-"$ESPTOOL" --chip esp32s3 --port "$PORT" --baud 921600 \
-  write_flash "$PART_OFFSET" "$MODEL" 2>&1 | tr '\r' '\n' | tail -2
-
-# --input-dir: `upload` does not rebuild, so point it at the build just made.
-echo "=== upload firmware ==="
-arduino-cli upload -p "$PORT" --fqbn "$FQBN" --input-dir "$BUILD_DIR" "$SKETCH" 2>&1 | tail -1
-
-# Compute the same FNV-1a fingerprint printed by the firmware.
+# Compute the same FNV-1a fingerprint the firmware prints at boot, and show it
+# before writing anything, so what is about to be installed is stated up front.
 FP=$(python3 -c '
 import sys
 d = open(sys.argv[1], "rb").read()
@@ -114,8 +202,27 @@ h = 2166136261
 for b in d:
     h ^= b; h = (h * 16777619) & 0xFFFFFFFF
 print("%08x" % h)' "$MODEL")
+BYTES=$(wc -c < "$MODEL" | tr -d ' ')
 
 echo
-echo "flashed : $MODEL"
-echo "expect  : fp=$FP  bytes=$(wc -c < "$MODEL" | tr -d ' ')"
+echo "=== about to flash, replacing the model now on the board ==="
+printf "  model   : %s\n" "$MODEL_KIND"
+printf "  sketch  : %s\n" "$SKETCH"
+printf "  binary  : %s\n" "$MODEL"
+printf "  port    : %s\n" "$PORT"
+printf "  bytes   : %s\n" "$BYTES"
+printf "  expect  : fp=%s\n" "$FP"
+echo
+
+echo "=== flash model -> $PORT @ $PART_OFFSET ==="
+"$ESPTOOL" --chip esp32s3 --port "$PORT" --baud 921600 \
+  write_flash "$PART_OFFSET" "$MODEL" 2>&1 | tr '\r' '\n' | tail -2
+
+# --input-dir: `upload` does not rebuild, so point it at the build just made.
+echo "=== upload firmware ==="
+arduino-cli upload -p "$PORT" --fqbn "$FQBN" --input-dir "$BUILD_DIR" "$SKETCH" 2>&1 | tail -1
+
+echo
+echo "flashed : $MODEL_KIND from $MODEL"
+echo "expect  : fp=$FP  bytes=$BYTES"
 echo "the board prints 'build: bytes=... fp=...' at boot - both must match."
