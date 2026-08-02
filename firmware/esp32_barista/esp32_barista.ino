@@ -7,7 +7,8 @@
 // of it, and it makes words outside the vocabulary literally unsayable. There
 // are no digit tokens at all, so the model cannot invent "grind 2 steps finer".
 //
-// Serial only. Type a question, the answer streams back.
+// Input is USB serial: type a question, the answer streams back there and,
+// when a panel is wired, to the OLED as well.
 //
 // Configuration: the per-position core is staged to int8 in PSRAM once at boot,
 // and eligible per-layer matvecs are split across both LX7 cores.
@@ -29,6 +30,17 @@
 #include "generated/tokenizer_encoder.h"
 #include "generated/barista_words.h"
 #include "generated/barista_out2in.h"
+
+// Bumped when the deployed model changes; shown on the splash screen.
+#define BARISTA_VERSION "0.1"
+
+// Set to 0 to run serial-only, with no panel wired. See display.h for wiring.
+#ifndef USE_DISPLAY
+#define USE_DISPLAY 1
+#endif
+#if USE_DISPLAY
+#include "display.h"
+#endif
 
 static Model model;
 static Scratch scratch;
@@ -165,10 +177,27 @@ static void alloc_scratch() {
 static void answer(const char *question) {
   uint16_t ids[BTK_MAX_INPUT_BYTES];
   int n = bpe_encode_ascii(&tokenizer, question, ids, (int)(sizeof(ids)/sizeof(ids[0])));
-  if (n == BTK_ERR_NOT_ASCII) { Serial.println("(ascii only)"); return; }
-  if (n <= 0 || n > model.c.seq_len - BARISTA_ANSWER_ROOM) {
-    Serial.println("(question too long)"); return;
+  if (n == BTK_ERR_NOT_ASCII) {
+    Serial.println("(ascii only)");
+#if USE_DISPLAY
+    display_question(question);
+    display_notice("(ascii only)");
+#endif
+    return;
   }
+  if (n <= 0 || n > model.c.seq_len - BARISTA_ANSWER_ROOM) {
+    Serial.println("(question too long)");
+#if USE_DISPLAY
+    display_clear();
+    display_word("(question too long)", false);
+    display_flush();
+#endif
+    return;
+  }
+
+#if USE_DISPLAY
+  display_question(question);
+#endif
 
   int64_t t0 = esp_timer_get_time();
 #if BARISTA_PROFILE
@@ -191,6 +220,10 @@ static void answer(const char *question) {
     if (words_out && !punct) Serial.print(' ');
     Serial.print(w);            // stream it as it is produced
     Serial.flush();
+#if USE_DISPLAY
+    display_word(w, !punct);
+    display_flush();
+#endif
     words_out++;
     // The head emits an output CLASS. Feeding it forward needs the input token
     // id that class corresponds to, which is what out2in holds.
@@ -244,6 +277,10 @@ void setup() {
                          &tokenizer)) {
     Serial.println("tokenizer load failed"); return;
   }
+#if USE_DISPLAY
+  if (!display_begin())
+    Serial.printf("no display answering on i2c 0x%02X; serial only\n", OLED_ADDR);
+#endif
   const esp_partition_t *part = esp_partition_find_first(
       ESP_PARTITION_TYPE_DATA, (esp_partition_subtype_t)0x40, "model");
   if (!part) { Serial.println("no model partition"); return; }
@@ -317,6 +354,9 @@ void setup() {
   else Serial.println("dual-core worker failed; running single core");
 
   ready = true;
+#if USE_DISPLAY
+  display_splash();
+#endif
   Serial.println("READY>");
 }
 
