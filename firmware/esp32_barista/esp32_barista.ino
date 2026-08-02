@@ -1,8 +1,8 @@
-// Barista: a question in, an answer out, written word by word. No chat history.
-// The model generates the text; it does not select from a catalogue.
+// Barista: a question in, an answer out, one output class at a time. No chat
+// history. The model generates the text; it does not select from a catalogue.
 //
 // Asymmetric vocabulary: it READS 8057 input tokens so it can take varied ASCII
-// questions, and WRITES only the 854 curated espresso words in the output head.
+// questions, and WRITES only its 854-class espresso output alphabet.
 // That keeps the head a small fraction of per-token compute instead of the bulk
 // of it, and it makes words outside the vocabulary literally unsayable. There
 // are no digit tokens at all, so the model cannot invent "grind 2 steps finer".
@@ -19,8 +19,16 @@
 
 #define LLM_INT8_ACT 1
 // Set to 1 to print where the time goes, per answer. Costs a few microseconds
-// of esp_timer calls per layer; leave off for demos.
+// of esp_timer calls per layer; leave off for demos. Measure with USE_DISPLAY 0,
+// or the per-piece panel redraw lands in the wall-clock total.
+#ifndef BARISTA_PROFILE
 #define BARISTA_PROFILE 0
+#endif
+
+// Set to 0 to run every matvec on one core, for measuring what the split buys.
+#ifndef BARISTA_DUAL_CORE
+#define BARISTA_DUAL_CORE 1
+#endif
 #if BARISTA_PROFILE
 #define LLM_PROFILE 1
 #define LLM_PROFILE_NOW() esp_timer_get_time()
@@ -48,6 +56,7 @@ static BpeTokenizer tokenizer;
 static bool ready = false;
 
 // ---- dual-core per-layer matvec --------------------------------------------
+#if BARISTA_DUAL_CORE
 static TaskHandle_t worker_h, main_h;
 static const QT *job_t; static const int8_t *job_xq; static float job_xs;
 static float *job_y; static int job_split;
@@ -69,6 +78,7 @@ static void layer_matvec_par(const QT *t, const float *x, float *y) {
   matvec_i8_range(t, xq, xs, y, job_split, t->rows);
   ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
 }
+#endif
 
 static int sram_fallbacks = 0;
 static void *ps(size_t n) { return heap_caps_malloc(n, MALLOC_CAP_SPIRAM); }
@@ -101,7 +111,7 @@ static void *ps_or_die(size_t n, const char *what) {
  * rather than per matvec. */
 // Set to 0 to put the hot working set back in PSRAM. Kept as a switch so the
 // three-tier split can be A/B'd on one model: comparing across two models
-// confounds it, because answer length changes the forwards-per-word ratio.
+// confounds it, because answer length changes the forwards-per-piece ratio.
 #define BARISTA_SCRATCH_IN_SRAM 1
 static void *sram_or_ps(size_t n, const char *what) {
 #if !BARISTA_SCRATCH_IN_SRAM
@@ -172,7 +182,7 @@ static void alloc_scratch() {
 // Room reserved for the answer, so a long question cannot leave the generation
 // loop with nowhere to write.
 #define BARISTA_ANSWER_ROOM 56
-#define BARISTA_MAX_WORDS 48
+#define BARISTA_MAX_PIECES 48
 
 static void answer(const char *question) {
   uint16_t ids[BTK_MAX_INPUT_BYTES];
@@ -208,35 +218,37 @@ static void answer(const char *question) {
   llm_forward(&model, BARISTA_OUT2IN[BARISTA_BOS], pos++, &scratch);
 
   Serial.print("A: ");
-  int words_out = 0;
-  for (int step = 0; step < BARISTA_MAX_WORDS && pos < model.c.seq_len; step++) {
-    // greedy over the writable words
+  int pieces_out = 0;
+  // Each iteration emits one output class. Punctuation is a class, so these are
+  // pieces of output rather than readable words.
+  for (int step = 0; step < BARISTA_MAX_PIECES && pos < model.c.seq_len; step++) {
+    // greedy over output classes
     int best = 0;
     for (int k = 1; k < BARISTA_WORD_COUNT; k++)
       if (scratch.logits[k] > scratch.logits[best]) best = k;
     if (best == BARISTA_EOS) break;
     const char *w = BARISTA_WORDS[best];
     bool punct = (w[1] == '\0' && strchr(".,:;?", w[0]) != NULL);
-    if (words_out && !punct) Serial.print(' ');
+    if (pieces_out && !punct) Serial.print(' ');
     Serial.print(w);            // stream it as it is produced
     Serial.flush();
 #if USE_DISPLAY
     display_word(w, !punct);
     display_flush();
 #endif
-    words_out++;
+    pieces_out++;
     // The head emits an output CLASS. Feeding it forward needs the input token
     // id that class corresponds to, which is what out2in holds.
     llm_forward(&model, BARISTA_OUT2IN[best], pos++, &scratch);
   }
   double ms = (esp_timer_get_time() - t0) / 1000.0;
-  Serial.printf("\n[%d words, %.0f ms, %.1f words/s]\n", words_out, ms,
-                words_out * 1000.0 / ms);
+  Serial.printf("\n[%d pieces, %.0f ms, %.1f pieces/s]\n", pieces_out, ms,
+                pieces_out * 1000.0 / ms);
 #if BARISTA_PROFILE
   {
     // input = embedding row + PLE table row + ple_model_proj + RoPE.
     // Sums over every llm_forward in this answer, prompt positions included,
-    // so the total is larger than the generated-word count implies.
+    // so the forward count exceeds the number of pieces emitted.
     uint64_t in = scratch.profile.input_us, at = scratch.profile.attn_us;
     uint64_t ff = scratch.profile.ffn_us, pl = scratch.profile.ple_us;
     uint64_t hd = scratch.profile.head_us;
@@ -344,14 +356,31 @@ void setup() {
                   BARISTA_SCRATCH_IN_SRAM, sram_fallbacks);
   }
 
+  int dual_core_active = 0;
+#if BARISTA_DUAL_CORE
   main_h = xTaskGetCurrentTaskHandle();
   if (xTaskCreatePinnedToCore(worker_main,"mv",4096,NULL,2,&worker_h,0)==pdPASS) {
     model.layer_matvec = layer_matvec_par;
     // Only once the worker exists: layer_matvec_par notifies worker_h, so
     // assigning either hook before this point would signal a null handle.
     if (model.out_head.w8) model.head_matvec = layer_matvec_par;
+    dual_core_active = 1;
   }
   else Serial.println("dual-core worker failed; running single core");
+#endif
+
+  // Which build is actually running. The weights fingerprint above identifies
+  // the model; this identifies the switches, so a benchmark can require the
+  // configuration it claims to be measuring rather than trusting a label.
+#if USE_DISPLAY
+  int display_present_now = display_present ? 1 : 0;
+#else
+  int display_present_now = 0;
+#endif
+  Serial.printf("config: profile=%d dual_core_requested=%d dual_core_active=%d "
+                "display_enabled=%d display_present=%d\n",
+                BARISTA_PROFILE, BARISTA_DUAL_CORE, dual_core_active,
+                USE_DISPLAY, display_present_now);
 
   ready = true;
 #if USE_DISPLAY
