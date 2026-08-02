@@ -220,8 +220,23 @@ static void answer(const char *question) {
 #endif
 }
 
+// The line buffer below holds BTK_MAX_INPUT_BYTES, but the hardware CDC receive
+// queue defaults to 256, so a longer paste overruns the queue before loop() can
+// drain it and bytes are lost mid-line. Size the queue above the longest line
+// this sketch will accept, with room for the newline and whatever follows it in
+// the same burst.
+#define BARISTA_SERIAL_RX_BYTES (2 * BTK_MAX_INPUT_BYTES)
+
 void setup() {
+  // Must be requested before begin(), which allocates a 256-byte queue if none
+  // exists. A failed allocation returns 0 and begin() then falls back to that
+  // default, so the request has to be checked rather than assumed.
+  size_t rx_bytes = Serial.setRxBufferSize(BARISTA_SERIAL_RX_BYTES);
   Serial.begin(115200); delay(1500);
+  if (rx_bytes != BARISTA_SERIAL_RX_BYTES) {
+    Serial.println("serial RX buffer allocation failed");
+    return;
+  }
   Serial.println("\n=== ESP32 BARISTA ===");
   Serial.println("ask an espresso question; the model writes the answer.");
 
@@ -308,17 +323,25 @@ void setup() {
 void loop() {
   static char line[BTK_MAX_INPUT_BYTES];
   static int len = 0;
+  static bool overflowed = false;
   if (!ready) { delay(1000); return; }
   while (Serial.available()) {
     char ch = Serial.read();
     if (ch == '\r') continue;
     if (ch == '\n') {
       line[len] = '\0';
-      if (len) answer(line);
-      len = 0;
+      // Report the rejection once, at the newline, rather than per byte, and
+      // clear both pieces of state so the next question starts fresh.
+      if (overflowed) Serial.println("(question too long)");
+      else if (len) answer(line);
+      len = 0; overflowed = false;
       Serial.println("READY>");
     } else if (len < (int)sizeof(line) - 1) {
       line[len++] = ch;
+    } else {
+      // Past the buffer. Keep consuming to the newline so the tail of an
+      // oversized line cannot be read as the beginning of the next one.
+      overflowed = true;
     }
   }
   delay(5);
