@@ -87,10 +87,10 @@ uv run python -m research.tinystories.analyze --tag clean \
   --expect-arms baseline,ple,ple_notable,fatembed,bigcore --expect-seeds 2
 ```
 
-`--tag`, `--expect-arms` and `--expect-seeds` are all required. `runs/` accumulates several cohorts plus records from
-other models, and averaging across them produces confident nonsense: the same
-archive that yields the published +0.098 nats within the deploy cohort yields
-+0.074 when mixed.
+`--tag`, `--expect-arms` and `--expect-seeds` are all required. `runs/`
+accumulates several cohorts plus records from other models, and averaging across
+them reports a number that describes no cohort: the same archive that yields the
+published +0.098 nats within the deploy cohort yields +0.074 when mixed.
 
 The analyzer refuses a cohort whose runs disagree on vocabulary, sequence
 length, batch size, steps or learning rate. Model shape is deliberately not
@@ -172,8 +172,9 @@ uv run python -m research.tinystories.sample \
 
 `--tokenizer` is required, and is verified against the hash the run recorded.
 Legacy checkpoints predate that hash and only warn. Decoding a 32,768-vocab run
-with the 4,096 tokenizer produces plausible nonsense rather than an error, which
-is why the check exists. `--seed` fixes the sampling stream.
+with the 4,096 tokenizer yields fluent text from the wrong token ids rather than
+an error, so the mismatch has to be rejected up front. `--seed` fixes the
+sampling stream.
 
 ## Export
 
