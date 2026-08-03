@@ -58,6 +58,11 @@ reasoning, and the memory trick does not change it. What is interesting here is 
 architecture, fitting a large model onto a tiny chip, rather than what a 28.9 million
 parameter model can say.
 
+## Models
+
+- [Barista](https://huggingface.co/slvDev/esp32-ai-barista) - espresso question answering
+- [TinyStories](https://huggingface.co/slvDev/esp32-ai-tinystories) - story generation
+
 ## Running it yourself
 
 Download and deployment are separate operations: one reaches the network, the
