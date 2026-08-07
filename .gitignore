@@ -4,10 +4,8 @@ __pycache__/
 *.pyc
 *.egg-info/
 
-# data + tokenizers (regenerate with research/tinystories/prepare.py)
-data/*.bin
-data/*.txt
-data/*.json
+# private training and evaluation data
+/data/
 
 # training outputs
 runs/

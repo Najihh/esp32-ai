@@ -22,7 +22,7 @@ from model import Config, TinyLM
 from quantize import quantize_model
 
 ROOT = Path(__file__).resolve().parents[2]
-DATA = str(ROOT / "data")
+DATA = ROOT / "data" / "tinystories"
 RUNS = str(ROOT / "runs")
 
 def load(path, device):
@@ -37,8 +37,7 @@ def load(path, device):
 def val_loss(model, vocab, device, iters=60, bs=16, sl=256, seed=1234):
     if not 0 < vocab <= 65536:
         raise SystemExit(f"vocab {vocab} exceeds the uint16 token bins")
-    suffix = "" if vocab == 4096 else f"_v{vocab}"
-    data = np.memmap(os.path.join(DATA, f"val{suffix}.bin"), dtype=np.uint16, mode="r")
+    data = np.memmap(DATA / f"vocab-{vocab}" / "val.bin", dtype=np.uint16, mode="r")
     rng = np.random.default_rng(seed)
     losses = []
     for _ in range(iters):

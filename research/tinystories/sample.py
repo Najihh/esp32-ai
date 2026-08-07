@@ -43,7 +43,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--run", required=True, help="path to a runs/*.pt checkpoint")
     ap.add_argument("--tokenizer", required=True,
-                    help="tokenizer this run was trained with, e.g. data/bpe32768.json")
+                    help="tokenizer this run was trained with, e.g. "
+                         "data/tinystories/vocab-32768/tokenizer.json")
     ap.add_argument("--prompt", default="Once upon a time")
     ap.add_argument("--tokens", type=int, default=200)
     ap.add_argument("--temperature", type=float, default=0.8)

@@ -15,10 +15,13 @@ from model import Config, TinyLM, make_model
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
-# Dataset and checkpoints stay at the repository root, shared by every
-# reproduction script here.
-DATA = str(ROOT / "data")
+# A vocabulary variant keeps its tokenizer and token bins together.
+DATA = ROOT / "data" / "tinystories"
 RUNS = str(ROOT / "runs")
+
+
+def variant_dir(vocab_size):
+    return DATA / f"vocab-{vocab_size}"
 
 
 def get_device():
@@ -30,11 +33,11 @@ def get_device():
 
 
 class Batcher:
-    def __init__(self, split, batch_size, seq_len, device, suffix="", seed=0):
+    def __init__(self, split, batch_size, seq_len, device, dataset, seed=0):
         # The bins are uint16. Reading a wider vocabulary through that dtype
         # yields plausible token ids rather than an error, so check before
         # opening.
-        self.data = np.memmap(os.path.join(DATA, f"{split}{suffix}.bin"), dtype=np.uint16, mode="r")
+        self.data = np.memmap(dataset / f"{split}.bin", dtype=np.uint16, mode="r")
         self.bs, self.sl, self.device = batch_size, seq_len, device
         # Batch order is part of the run. Without the seed here, torch.manual_seed
         # fixes initialisation only and two runs at the same --seed still see
@@ -87,7 +90,7 @@ def main():
     ap.add_argument("--fixed-ffn", type=int, default=None,
                     help="pin ffn_hidden and skip the core solver (table-scaling sweep)")
     # Published experiments always pass --vocab; the default is for ad-hoc runs.
-    ap.add_argument("--vocab", type=int, default=4096)
+    ap.add_argument("--vocab", type=int, default=32768)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--tag", default="")
     args = ap.parse_args()
@@ -100,7 +103,8 @@ def main():
         raise SystemExit(f"--vocab must be 1..65536; the token bins are uint16 "
                          f"and are memmapped as uint16")
 
-    tok_path = os.path.join(DATA, f"bpe{args.vocab}.json")
+    dataset = variant_dir(args.vocab)
+    tok_path = dataset / "tokenizer.json"
     if not os.path.exists(tok_path):
         raise SystemExit(
             f"{tok_path} missing. The bins this run trains on came from it, and "
@@ -111,9 +115,6 @@ def main():
     torch.manual_seed(args.seed)
     device = get_device()
     os.makedirs(RUNS, exist_ok=True)
-
-    # vocab 4096 uses the original train.bin/val.bin; other vocabs use suffixed bins.
-    suffix = "" if args.vocab == 4096 else f"_v{args.vocab}"
 
     base = Config(seq_len=args.seq_len, ple_dim=args.ple_dim, vocab_size=args.vocab,
                   d_model=args.d_model, n_layers=args.n_layers, n_heads=args.n_heads)
@@ -131,9 +132,9 @@ def main():
         betas=(0.9, 0.95),
     )
 
-    train_b = Batcher("train", args.batch_size, args.seq_len, device, suffix,
+    train_b = Batcher("train", args.batch_size, args.seq_len, device, dataset,
                       seed=args.seed)
-    val_b = Batcher("val", args.batch_size, args.seq_len, device, suffix)
+    val_b = Batcher("val", args.batch_size, args.seq_len, device, dataset)
 
     name = f"{args.arm}{'-' + args.tag if args.tag else ''}-s{args.seed}"
     history, best = [], float("inf")

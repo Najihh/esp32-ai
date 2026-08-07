@@ -34,9 +34,10 @@ licensed **CDLA-Sharing-1.0**. It is downloaded, not redistributed here.
 uv run python -m research.tinystories.prepare --vocab 32768
 ```
 
-Downloads the slice, trains the BPE and writes `uint16` token bins into `data/`
-at the repository root. Skips the download if the slice is already present. The
-4,096-vocab control used in `RESULTS.md` is `--vocab 4096`.
+Downloads the slice into `data/tinystories/raw/`, then writes the tokenizer and
+`uint16` token bins into `data/tinystories/vocab-32768/`. Each `--vocab` value
+gets its own directory, keeping the tokenizer beside the bins it produced.
+The 4,096-vocab control used in `RESULTS.md` is `--vocab 4096`.
 
 **Reproducibility is approximate.** The script fetches the dataset's `main`
 branch without pinning a revision and records no hash of the raw slice, and
@@ -167,7 +168,7 @@ checkpoint loading, validation data and arm loop.
 ```bash
 uv run python -m research.tinystories.sample \
   --run runs/ple-cleandeploy-s0.pt \
-  --tokenizer data/bpe32768.json
+  --tokenizer data/tinystories/vocab-32768/tokenizer.json
 ```
 
 `--tokenizer` is required, and is verified against the hash the run recorded.
@@ -183,6 +184,7 @@ artifact requires the exception to be explicit:
 
 ```bash
 uv run python -m research.tinystories.export ple-cleandeploy-s0 \
+  --tokenizer data/tinystories/vocab-32768/tokenizer.json \
   --allow-unverified-tokenizer
 ```
 

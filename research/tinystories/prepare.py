@@ -19,16 +19,20 @@ from tokenizers import Tokenizer, decoders, models, pre_tokenizers, trainers
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
-# The dataset stays at the repository root, shared by every reproduction
-# script here, and is downloaded only when absent.
-DATA = str(ROOT / "data")
+# Each vocabulary variant keeps its tokenizer beside the bins it produced.
+DATA = ROOT / "data" / "tinystories"
 URL = "https://huggingface.co/datasets/roneneldan/TinyStories/resolve/main/TinyStories-train.txt"
-RAW = os.path.join(DATA, "tinystories_slice.txt")
-VOCAB_SIZE = 4096  # overridden by --vocab; 4096 keeps the original bin names
+RAW = DATA / "raw" / "tinystories-train-first-300MiB.txt"
+DEFAULT_VOCAB = 32768   # what ships; every other size has to be asked for
+VOCAB_SIZE = DEFAULT_VOCAB  # set from --vocab before anything reads it
 # ~300MB of stories is ~75M tokens: enough to overtrain a 1M-param core well past
 # its compute-optimal point, which is the regime we actually care about.
 SLICE_BYTES = 300 * 1024 * 1024
 VAL_FRACTION = 0.005
+
+
+def variant_dir(vocab_size):
+    return DATA / f"vocab-{vocab_size}"
 
 
 def download():
@@ -66,10 +70,10 @@ def download():
 
 
 def train_tokenizer(text):
-    path = os.path.join(DATA, f"bpe{VOCAB_SIZE}.json")
+    path = variant_dir(VOCAB_SIZE) / "tokenizer.json"
     if os.path.exists(path):
         print(f"already have {path}")
-        return Tokenizer.from_file(path)
+        return Tokenizer.from_file(str(path))
     print(f"training BPE vocab={VOCAB_SIZE}...")
     tok = Tokenizer(models.BPE(unk_token=None))
     tok.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False)
@@ -80,25 +84,25 @@ def train_tokenizer(text):
         initial_alphabet=pre_tokenizers.ByteLevel.alphabet(),
         show_progress=True,
     )
-    # 40MB is plenty to fit a 4k merge table; using the full slice just burns time.
+    # 40MB is plenty to fit a merge table of the sizes used here; feeding the
+    # full slice just burns time for the same merges.
     tok.train_from_iterator([text[: 40 * 1024 * 1024]], trainer=trainer)
-    tok.save(path)
+    tok.save(str(path))
     return tok
 
 
 def main():
-    os.makedirs(DATA, exist_ok=True)  # gitignored; absent in a fresh clone
     global VOCAB_SIZE
     ap = argparse.ArgumentParser()
-    ap.add_argument("--vocab", type=int, default=4096)
+    ap.add_argument("--vocab", type=int, default=DEFAULT_VOCAB)
     args = ap.parse_args()
     if not 0 < args.vocab <= 65536:
         raise SystemExit(f"--vocab must be 1..65536; the bins are uint16 and "
                          f"every reader memmaps them as uint16")
     VOCAB_SIZE = args.vocab
-    # vocab 4096 keeps the original train.bin/val.bin; others get suffixed names
-    # so both datasets coexist and train.py can pick by --vocab.
-    suffix = "" if VOCAB_SIZE == 4096 else f"_v{VOCAB_SIZE}"
+    RAW.parent.mkdir(parents=True, exist_ok=True)
+    out = variant_dir(VOCAB_SIZE)
+    out.mkdir(parents=True, exist_ok=True)
 
     download()
     with open(RAW, "r", encoding="utf-8", errors="ignore") as f:
@@ -123,8 +127,8 @@ def main():
     arr = np.array(ids, dtype=np.uint16)
     assert arr.max() < VOCAB_SIZE
     n_val = int(len(arr) * VAL_FRACTION)
-    arr[:-n_val].tofile(os.path.join(DATA, f"train{suffix}.bin"))
-    arr[-n_val:].tofile(os.path.join(DATA, f"val{suffix}.bin"))
+    arr[:-n_val].tofile(out / "train.bin")
+    arr[-n_val:].tofile(out / "val.bin")
     print(f"train {len(arr) - n_val:,} tokens / val {n_val:,} tokens")
     print(f"compression: {len(text) / len(arr):.2f} bytes/token")
 

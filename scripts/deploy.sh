@@ -41,11 +41,9 @@ case "$MODEL_KIND" in
     TOKENIZER=${TOKENIZER:-$ARTIFACTS/tokenizer.json}
     GOLDEN=${GOLDEN:-$ARTIFACTS/golden.txt}
     REQUIRED=("$MODEL" "$TOKENIZER")
-    # That exporter has no output-path option: it always writes
-    # artifacts/tinystories/, so a custom path here needs a copy afterwards.
-    EXPORT_HINT="  uv run python -m research.tinystories.export <checkpoint-tag>
-  It always writes to artifacts/tinystories/. If a different path is selected
-  here, copy the files across afterwards."
+    FETCH_HINT="  scripts/fetch_model.sh tinystories
+  Downloads always install under artifacts/tinystories/. If a different path
+  is selected here, copy the files across afterwards."
     ;;
   barista)
     SKETCH=firmware/esp32_barista
@@ -56,16 +54,9 @@ case "$MODEL_KIND" in
     VOCAB=${VOCAB:-$ARTIFACTS/vocab.json}
     LAYOUT=${LAYOUT:-$ARTIFACTS/layout.json}
     REQUIRED=("$MODEL" "$TOKENIZER" "$VOCAB" "$LAYOUT")
-    # export.py writes model.bin, the goldens and metadata. It reads the other
-    # three, which are frozen with the trained model and cannot be regenerated
-    # here, so they have to be in place first.
-    EXPORT_HINT="  tokenizer.json, vocab.json and layout.json are frozen assets:
-  place them at the paths above first. Then produce model.bin, the goldens and
-  metadata with:
-    uv run python $SKETCH/tools/export.py --checkpoint <path> \\
-      --vocab \"$VOCAB\" \\
-      --layout \"$LAYOUT\" \\
-      --out-dir \"$ARTIFACTS\""
+    FETCH_HINT="  scripts/fetch_model.sh barista
+  Downloads always install under artifacts/barista/. If a different path is
+  selected here, copy the files across afterwards."
     ;;
   *)
     usage
@@ -156,7 +147,7 @@ for f in "${REQUIRED[@]}"; do
 done
 if [ "$missing" -ne 0 ]; then
   echo "required artifacts are missing; the expected paths are listed above" >&2
-  echo "$EXPORT_HINT" >&2
+  echo "$FETCH_HINT" >&2
   exit 1
 fi
 

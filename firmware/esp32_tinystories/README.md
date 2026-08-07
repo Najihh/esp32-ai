@@ -51,7 +51,9 @@ uv run python firmware/esp32_tinystories/tools/generate_vocab.py \
 Regenerate the model artifacts from a checkpoint:
 
 ```bash
-uv run python -m research.tinystories.export <checkpoint-tag>
+TAG=ple-cleandeploy-s0                              # a checkpoint under runs/
+TOKENIZER=data/tinystories/vocab-32768/tokenizer.json   # the one it trained on
+uv run python -m research.tinystories.export "$TAG" --tokenizer "$TOKENIZER"
 ```
 
 Watch the board:

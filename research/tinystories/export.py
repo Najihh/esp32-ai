@@ -38,7 +38,6 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 RUNS = str(ROOT / "runs")
 OUT = str(ROOT / "artifacts" / "tinystories")
-TOK = str(ROOT / "data" / "bpe32768.json")
 MAGIC = 0x00454C50  # "PLE\0"
 FORMAT_VERSION = 1
 HEADER_BYTES = 56
@@ -117,7 +116,7 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("tag", nargs="?", default="ple-cleandeploy-s0",
                     help="checkpoint tag under runs/, without .pt")
-    ap.add_argument("--tokenizer", default=TOK,
+    ap.add_argument("--tokenizer", required=True,
                     help="tokenizer this checkpoint was trained with; its size "
                          "becomes output_vocab")
     ap.add_argument("--allow-unverified-tokenizer", action="store_true",
