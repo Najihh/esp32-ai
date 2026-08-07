@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Does the gain scale with table size?
+# Does the gain scale with table size? At vocab 4096, the same control the
+# small-vocabulary ablation uses.
 #
 # FFN is fixed at 256 so the core does not shrink as ple_dim grows. Without that
 # the table cannibalises compute and the sweep measures the wrong thing.
@@ -16,8 +17,8 @@ for pd in 64 128 256 512; do
   for arm in ple ple_notable; do
     log "RUN $arm ple_dim=$pd"
     uv run python -m research.tinystories.train \
-      --arm "$arm" --fixed-ffn 256 --ple-dim "$pd" --steps 3000 --seed 0 \
-      --tag "fix-d$pd"
+      --arm "$arm" --vocab 4096 --fixed-ffn 256 --ple-dim "$pd" --steps 3000 \
+      --seed 0 --tag "fix-d$pd"
   done
 done
 

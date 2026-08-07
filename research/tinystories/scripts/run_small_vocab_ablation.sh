@@ -13,7 +13,8 @@ for seed in 0 1; do
   for arm in baseline ple ple_notable fatembed bigcore; do
     log "RUN $arm seed$seed"
     uv run python -m research.tinystories.train \
-      --arm "$arm" --target-core 1500000 --steps 3000 --seed "$seed" --tag clean
+      --arm "$arm" --vocab 4096 --target-core 1500000 --steps 3000 \
+      --seed "$seed" --tag clean
   done
 done
 

@@ -86,6 +86,7 @@ def main():
     ap.add_argument("--n-heads", type=int, default=4)
     ap.add_argument("--fixed-ffn", type=int, default=None,
                     help="pin ffn_hidden and skip the core solver (table-scaling sweep)")
+    # Published experiments always pass --vocab; the default is for ad-hoc runs.
     ap.add_argument("--vocab", type=int, default=4096)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--tag", default="")

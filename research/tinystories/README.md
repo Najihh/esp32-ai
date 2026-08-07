@@ -57,7 +57,7 @@ is fair:
 | `bigcore` | the table budget spent on a wider core instead |
 
 ```bash
-uv run python -m research.tinystories.train --arm ple \
+uv run python -m research.tinystories.train --arm ple --vocab 4096 \
   --steps 3000 --target-core 1500000 --seed 0
 ```
 
