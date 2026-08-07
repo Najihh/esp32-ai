@@ -69,9 +69,13 @@ Download and deployment are separate operations: one reaches the network, the
 other touches the board.
 
 ```bash
-scripts/fetch_model.sh <tinystories|barista>   # download, verify, install into artifacts/
-scripts/deploy.sh      <tinystories|barista>   # generate headers, run gates, compile, flash
+scripts/fetch_model.sh barista   # download, verify, install into artifacts/
+scripts/deploy.sh barista        # generate headers, run gates, compile, flash
 ```
+
+`tinystories` is the other model, and takes the same two commands. Both require
+the model to be named, because the board holds one at a time and deploying
+replaces it.
 
 `fetch_model.sh` checks the inference assets against a SHA-256 and byte size
 pinned in the script, and cross-checks the release's own `metadata.json` against
@@ -79,10 +83,10 @@ those same pins. It installs nothing unless every check passes, so a failed
 download leaves what you already have untouched. `deploy.sh` downloads no model:
 it works from whatever is already in `artifacts/<model>/`. It does run two of its
 header tools through `uv`, which fetches one pinned wheel the first time on a
-machine that has never cached it. Both require the model to be named, because the
-board holds one at a time and deploying replaces it.
+machine that has never cached it.
 
 The firmware details and the boot output to expect live in
+[`firmware/esp32_barista/README.md`](firmware/esp32_barista/README.md) and
 [`firmware/esp32_tinystories/README.md`](firmware/esp32_tinystories/README.md). The reusable
 architecture is in `src/`; the training, ablation and quantization code that
 reproduces the published numbers is in `research/tinystories/`. The full method,
